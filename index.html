@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Boneco 3D</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #e9edf2; overflow: hidden; font-family: system-ui, sans-serif; }
+    canvas { display: block; }
+    #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; }
+    button {
+      border: 0; border-radius: 8px; padding: 10px 14px; font-size: 14px; cursor: pointer;
+      background: #1b2a4a; color: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.2);
+    }
+    button:hover { background: #24375f; }
+    #hint { position: fixed; top: 16px; left: 16px; color: #556; font-size: 13px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hint">Arraste para girar · role para dar zoom</div>
+  <div id="ui">
+    <button id="spin">Pausar rotação</button>
+    <button id="export">Baixar .glb</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+    // ---------- Cena ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xe9edf2);
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(1.6, 1.4, 3.6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.95, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 1.2;
+    controls.maxDistance = 8;
+    controls.maxPolarAngle = Math.PI * 0.55;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 1.2;
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f99, 1.1));
+    const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+    sun.position.set(2.5, 4, 3);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -1.5; sun.shadow.camera.right = 1.5;
+    sun.shadow.camera.top = 2.5; sun.shadow.camera.bottom = -0.5;
+    sun.shadow.bias = -0.0005;
+    scene.add(sun);
+    const rim = new THREE.DirectionalLight(0xbcd0ff, 0.8);
+    rim.position.set(-3, 2, -2);
+    scene.add(rim);
+
+    const ground = new THREE.Mesh(
+      new THREE.CircleGeometry(30, 64),
+      new THREE.MeshStandardMaterial({ color: 0xdfe4ea, roughness: 1 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // ---------- Materiais ----------
+    const mat = {
+      skin:  new THREE.MeshStandardMaterial({ color: 0xe2b08c, roughness: 0.6 }),
+      shirt: new THREE.MeshStandardMaterial({ color: 0x1b2a4a, roughness: 0.85 }), // azul escuro
+      pants: new THREE.MeshStandardMaterial({ color: 0x3c3f45, roughness: 0.9 }),
+      shoe:  new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.5 }),
+      sole:  new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.7 }),
+      hair:  new THREE.MeshStandardMaterial({ color: 0x3b2618, roughness: 0.8 }),
+      eye:   new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.3 }),
+      white: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 }),
+      mouth: new THREE.MeshStandardMaterial({ color: 0x9c4a3c, roughness: 0.6 }),
+    };
+
+    function part(geo, material, parent, pos = [0, 0, 0], scale, rot) {
+      const m = new THREE.Mesh(geo, material);
+      m.position.set(...pos);
+      if (scale) m.scale.set(...scale);
+      if (rot) m.rotation.set(...rot);
+      m.castShadow = true;
+      m.receiveShadow = true;
+      parent.add(m);
+      return m;
+    }
+
+    // ---------- Boneco ----------
+    const doll = new THREE.Group();
+    doll.name = 'BonecoMasculino';
+    scene.add(doll);
+
+    // Pernas + sapatos
+    for (const s of [-1, 1]) {
+      const x = 0.095 * s;
+      part(new THREE.CapsuleGeometry(0.078, 0.72, 8, 24), mat.pants, doll, [x, 0.52, 0]);
+      part(new THREE.CapsuleGeometry(0.068, 0.14, 8, 24), mat.shoe, doll, [x, 0.07, 0.045], [1.0, 0.75, 1], [Math.PI / 2, 0, 0]);
+      part(new THREE.CapsuleGeometry(0.07, 0.15, 8, 24), mat.sole, doll, [x, 0.018, 0.045], [1.0, 0.25, 1], [Math.PI / 2, 0, 0]);
+    }
+
+    // Quadril (calça)
+    part(new THREE.CapsuleGeometry(0.15, 0.06, 8, 32), mat.pants, doll, [0, 0.93, 0], [1.25, 1, 0.75]);
+
+    // Tronco (camiseta azul escuro)
+    const torso = new THREE.Group();
+    torso.position.y = 0.95;
+    doll.add(torso);
+    part(new THREE.CapsuleGeometry(0.17, 0.3, 12, 32), mat.shirt, torso, [0, 0.26, 0], [1.3, 1, 0.72]);
+    // barra da camiseta
+    part(new THREE.CylinderGeometry(0.205, 0.2, 0.08, 40), mat.shirt, torso, [0, 0.06, 0], [1.08, 1, 0.66]);
+    // gola
+    part(new THREE.TorusGeometry(0.058, 0.014, 12, 32), mat.shirt, torso, [0, 0.505, 0.005], [1, 1, 0.9], [Math.PI / 2, 0, 0]);
+
+    // Pescoço + cabeça
+    const headGroup = new THREE.Group();
+    headGroup.position.y = 1.47;
+    doll.add(headGroup);
+    part(new THREE.CylinderGeometry(0.048, 0.054, 0.12, 24), mat.skin, headGroup, [0, 0.03, 0]);
+
+    const head = new THREE.Group();
+    head.position.y = 0.2;
+    headGroup.add(head);
+    part(new THREE.SphereGeometry(0.12, 40, 32), mat.skin, head, [0, 0, 0], [0.95, 1.12, 1]);
+    // cabelo (calota superior)
+    part(new THREE.SphereGeometry(0.128, 40, 24, 0, Math.PI * 2, 0, Math.PI * 0.48), mat.hair, head, [0, 0.02, -0.008], [0.98, 1.12, 1.04], [-0.25, 0, 0]);
+    // olhos
+    for (const s of [-1, 1]) {
+      part(new THREE.SphereGeometry(0.02, 20, 16), mat.white, head, [0.042 * s, 0.015, 0.103], [1, 1, 0.5]);
+      part(new THREE.SphereGeometry(0.011, 16, 12), mat.eye, head, [0.042 * s, 0.015, 0.113]);
+      // sobrancelhas
+      part(new THREE.CapsuleGeometry(0.006, 0.03, 4, 8), mat.hair, head, [0.044 * s, 0.05, 0.108], null, [0, 0, Math.PI / 2 + 0.12 * s]);
+      // orelhas
+      part(new THREE.SphereGeometry(0.028, 16, 12), mat.skin, head, [0.115 * s, 0.0, 0], [0.45, 1, 0.75]);
+    }
+    // nariz e boca
+    part(new THREE.SphereGeometry(0.016, 16, 12), mat.skin, head, [0, -0.015, 0.118], [0.9, 1.1, 1]);
+    part(new THREE.CapsuleGeometry(0.006, 0.03, 4, 8), mat.mouth, head, [0, -0.06, 0.105], null, [0, 0, Math.PI / 2]);
+
+    // Braços (manga curta da camiseta + pele)
+    const arms = [];
+    for (const s of [-1, 1]) {
+      const arm = new THREE.Group();
+      arm.position.set(0.235 * s, 1.39, 0);
+      arm.rotation.z = 0.13 * s;
+      doll.add(arm);
+      part(new THREE.SphereGeometry(0.082, 24, 16), mat.shirt, arm, [0, 0, 0]);                 // ombro
+      part(new THREE.CylinderGeometry(0.08, 0.074, 0.2, 24), mat.shirt, arm, [0, -0.1, 0]);       // manga
+      part(new THREE.CapsuleGeometry(0.052, 0.22, 8, 16), mat.skin, arm, [0, -0.24, 0]);          // braço
+      part(new THREE.CapsuleGeometry(0.046, 0.22, 8, 16), mat.skin, arm, [0, -0.47, 0.01]);       // antebraço
+      part(new THREE.SphereGeometry(0.055, 20, 16), mat.skin, arm, [0, -0.64, 0.015], [0.7, 1.1, 1]); // mão
+      arms.push(arm);
+    }
+
+    // ---------- UI ----------
+    document.getElementById('spin').onclick = (e) => {
+      controls.autoRotate = !controls.autoRotate;
+      e.target.textContent = controls.autoRotate ? 'Pausar rotação' : 'Girar';
+    };
+    document.getElementById('export').onclick = () => {
+      new GLTFExporter().parse(doll, (glb) => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([glb], { type: 'model/gltf-binary' }));
+        a.download = 'boneco.glb';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }, console.error, { binary: true });
+    };
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ---------- Animação (respiração leve) ----------
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => {
+      const t = clock.getElapsedTime();
+      const breathe = Math.sin(t * 1.6) * 0.008;
+      torso.scale.set(1 + breathe, 1 + breathe * 0.5, 1 + breathe);
+      headGroup.position.y = 1.47 + breathe * 0.4;
+      arms.forEach((a, i) => (a.rotation.z = (i ? 1 : -1) * (0.13 + Math.sin(t * 1.6) * 0.015)));
+      head.rotation.y = Math.sin(t * 0.5) * 0.15;
+      controls.update();
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
