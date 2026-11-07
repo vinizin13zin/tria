@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>03:33</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #out { display: block; height: 100vh; margin: 0 auto; image-rendering: pixelated; }
+  #play { position: fixed; inset: 0; margin: auto; width: 180px; height: 56px; font: bold 18px sans-serif;
+          background: #b00; color: #fff; border: 0; border-radius: 8px; cursor: pointer; }
+</style>
+<script src="timeline.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="out" width="720" height="1280"></canvas>
+<script type="module">
+import * as THREE from 'three';
+
+// ====================================================================
+//  Configuração geral — visual estilo PS2
+// ====================================================================
+const TL = window.TL, M = TL.marks;
+const W = 240, H = 426;           // resolução interna (baixa, 9:16)
+const OW = 720, OH = 1280;        // saída (x3, vizinho mais próximo)
+const TVW = 128, TVH = 96;        // resolução da "tela" do CRT
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, W / H, 0.05, 200);
+
+// --- RNG determinístico (cada quadro é sempre igual) ---
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const ease = (k) => { k = clamp(k); return k * k * (3 - 2 * k); };
+const seg01 = (t, a, b) => clamp((t - a) / (b - a));
+const step = (t, fps) => Math.floor(t * fps) / fps; // movimento "travado"
+
+// --- tremor de vértices (snap em espaço de tela, típico do PS2) ---
+const snapU = { value: new THREE.Vector2(W / 2, H / 2) };
+function ps2(mat) {
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uSnap = snapU;
+    sh.vertexShader = 'uniform vec2 uSnap;\n' + sh.vertexShader.replace('#include <project_vertex>',
+      '#include <project_vertex>\n  gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;');
+  };
+  return mat;
+}
+const L = (color, map, extra = {}) => ps2(new THREE.MeshLambertMaterial({ color, map: map || null, ...extra }));
+
+// --- texturas procedurais de baixa resolução ---
+function tex(w, h, draw, repeat) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d'); draw(g, w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
+  t.colorSpace = THREE.SRGBColorSpace;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat[0], repeat[1]); }
+  t.userData.canvas = c;
+  return t;
+}
+function noise(g, w, h, base, amt, seed = 1) {
+  const r = rng(seed), d = g.getImageData(0, 0, w, h);
+  const c = new THREE.Color(base);
+  for (let i = 0; i < w * h; i++) {
+    const n = (r() - 0.5) * amt;
+    d.data[i * 4] = clamp(c.r * 255 + n, 0, 255); d.data[i * 4 + 1] = clamp(c.g * 255 + n, 0, 255);
+    d.data[i * 4 + 2] = clamp(c.b * 255 + n, 0, 255); d.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(d, 0, 0);
+}
+function stains(g, w, h, n, color, seed) {
+  const r = rng(seed);
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = color; g.globalAlpha = 0.15 + r() * 0.25;
+    g.beginPath(); g.ellipse(r() * w, r() * h, 2 + r() * w * 0.15, 2 + r() * h * 0.2, r() * 3, 0, 7); g.fill();
+  }
+  g.globalAlpha = 1;
+}
+
+function mesh(geo, mat, parent, pos, rot, scale) {
+  const m = new THREE.Mesh(geo, mat);
+  if (pos) m.position.set(...pos); if (rot) m.rotation.set(...rot); if (scale) m.scale.set(...scale);
+  parent.add(m); return m;
+}
+function joint(parent, pos) { const j = new THREE.Group(); j.position.set(...pos); parent.add(j); return j; }
+function limb(parent, len, r0, r1, mat, sides = 6) {
+  const g = new THREE.CylinderGeometry(r1, r0, len, sides); g.translate(0, -len / 2, 0);
+  return mesh(g, mat, parent);
+}
+
+const tmpV = new THREE.Vector3(), UPV = new THREE.Vector3(0, 1, 0);
+function camAt(cam, p, look, shake = 0, seed = 0, up = null) {
+  cam.up.copy(up || UPV);
+  cam.position.copy(p);
+  if (shake) { const r = rng(seed); cam.position.x += (r() - 0.5) * shake; cam.position.y += (r() - 0.5) * shake; }
+  cam.lookAt(look);
+}
+const wpos = (obj, off = [0, 0, 0]) => { obj.updateWorldMatrix(true, false); return obj.localToWorld(tmpV.set(...off)).clone(); };
+// vira a cabeça (aos trancos) para encarar um ponto do mundo
+function headLook(head, target, k, tilt = 0) {
+  scene.updateMatrixWorld(true);
+  const q0 = head.quaternion.clone(); head.lookAt(target); head.rotateZ(tilt);
+  const q1 = head.quaternion.clone(); head.quaternion.slerpQuaternions(q0, q1, k);
+}
+function lerpV(a, b, k) { return new THREE.Vector3().lerpVectors(a, b, k); }
+
+// ====================================================================
+//  Pós-processamento (paleta reduzida + dithering + glitch) e textos
+// ====================================================================
+const sc = document.createElement('canvas'); sc.width = W; sc.height = H;
+const sctx = sc.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out'), octx = out.getContext('2d');
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v / 16 - 0.5) * 10);
+const scan = document.createElement('canvas'); scan.width = OW; scan.height = OH;
+{ const g = scan.getContext('2d'); g.fillStyle = 'rgba(0,0,0,0.22)'; for (let y = 0; y < OH; y += 3) g.fillRect(0, y, OW, 1);
+  const vg = g.createRadialGradient(OW / 2, OH / 2, OH * 0.25, OW / 2, OH / 2, OH * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.75)'); g.fillStyle = vg; g.fillRect(0, 0, OW, OH); }
+
+function post(fx, frame) {
+  sctx.drawImage(renderer.domElement, 0, 0);
+  const img = sctx.getImageData(0, 0, W, H), d = img.data, r = rng(frame * 7 + 3);
+  const [tr, tg, tb] = fx.tint || [1, 1, 1];
+  const gr = fx.grain ?? 10, bright = fx.bright ?? 1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, b = BAYER[(x & 3) + ((y & 3) << 2)], n = (r() - 0.5) * gr;
+    d[i] = (clamp(d[i] * tr * bright + b + n, 0, 255) >> 3) << 3;
+    d[i + 1] = (clamp(d[i + 1] * tg * bright + b + n, 0, 255) >> 3) << 3;
+    d[i + 2] = (clamp(d[i + 2] * tb * bright + b + n, 0, 255) >> 3) << 3;
+  }
+  if (fx.fisheye) fisheye(d, fx.fisheye);
+  if (fx.static) for (let i = 0; i < d.length; i += 4) { const v = r() * 255; d[i] = lerp(d[i], v, fx.static); d[i + 1] = lerp(d[i + 1], v, fx.static); d[i + 2] = lerp(d[i + 2], v, fx.static); }
+  sctx.putImageData(img, 0, 0);
+  octx.imageSmoothingEnabled = false;
+  octx.fillStyle = '#000'; octx.fillRect(0, 0, OW, OH);
+  if (fx.black) return;
+  const z = fx.zoom || 1;
+  octx.drawImage(sc, 0, 0, W, H, OW / 2 - OW * z / 2, OH / 2 - OH * z / 2, OW * z, OH * z);
+  if (fx.glitch) {                // faixas deslocadas + separação RGB
+    const g = fx.glitch;
+    for (let k = 0; k < 6 + g * 10; k++) {
+      const y = Math.floor(r() * OH), h = 6 + Math.floor(r() * 60 * g), dx = Math.floor((r() - 0.5) * 140 * g);
+      octx.drawImage(out, 0, y, OW, h, dx, y, OW, h);
+    }
+    octx.globalCompositeOperation = 'lighter'; octx.globalAlpha = 0.35 * g;
+    octx.drawImage(sc, 0, 0, W, H, 8 * g, 0, OW, OH);
+    octx.globalAlpha = 1; octx.globalCompositeOperation = 'source-over';
+  }
+  if (fx.flash) { octx.fillStyle = `rgba(255,255,255,${fx.flash})`; octx.fillRect(0, 0, OW, OH); }
+  if (fx.red) { octx.fillStyle = `rgba(160,0,0,${fx.red})`; octx.globalCompositeOperation = 'multiply'; octx.fillRect(0, 0, OW, OH); octx.globalCompositeOperation = 'source-over'; }
+  octx.drawImage(scan, 0, 0);
+}
+
+function wrap(ctx, text, maxW) {
+  const words = text.split(' '), lines = []; let cur = '';
+  for (const w of words) { const tst = cur ? cur + ' ' + w : w; if (ctx.measureText(tst).width > maxW && cur) { lines.push(cur); cur = w; } else cur = tst; }
+  if (cur) lines.push(cur); return lines;
+}
+function drawSubs(t) {
+  for (const s of TL.subs) {
+    if (t < s.t0 || t > s.t1) continue;
+    const cps = s.cps || (s.kind === 'big' ? 22 : 30);
+    const n = Math.floor((t - s.t0) * cps);
+    const alpha = clamp((s.t1 - t) / 0.25);
+    const size = s.kind === 'big' ? 64 : s.kind === 'end' ? 46 : 46;
+    octx.font = `900 ${size}px "Liberation Sans", Arial, sans-serif`;
+    octx.textAlign = 'left'; octx.textBaseline = 'middle';
+    const lines = wrap(octx, s.text, 620);
+    const lh = size * 1.18;
+    const cy = s.kind === 'big' ? OH * 0.2 : s.kind === 'end' ? OH * 0.5 : OH * 0.70;
+    let y0 = cy - (lines.length - 1) * lh / 2, shown = 0;
+    octx.globalAlpha = alpha;
+    for (const line of lines) {
+      const fullW = octx.measureText(line).width; let x = OW / 2 - fullW / 2;
+      for (const word of line.split(' ')) {
+        const vis = word.slice(0, Math.max(0, n - shown)); shown += word.length + 1;
+        if (vis) {
+          const red = (s.kind === 'big' && s.text !== '...VOCÊ ATENDERIA?') || s.text === 'NÃO ATENDE.' || (word.replace(/[^A-ZÇÃÉÍÓÚÂÊÔ]/g, '').length >= 3 && word === word.toUpperCase());
+          octx.lineWidth = 10; octx.lineJoin = 'round'; octx.strokeStyle = '#000'; octx.strokeText(vis, x, y0);
+          octx.fillStyle = red ? '#ff2a2a' : (s.kind === 'end' ? '#e6e6e6' : s.kind === 'phone' ? '#7dffa0' : '#fff'); octx.fillText(vis, x, y0);
+        }
+        x += octx.measureText(word + ' ').width;
+      }
+      y0 += lh;
+    }
+    octx.globalAlpha = 1;
+  }
+}
+
+// ====================================================================
+//  TEXTURAS
+// ====================================================================
+const T = {};
+T.wall = tex(64, 64, (g, w, h) => { noise(g, w, h, 0x8a7f6c, 18, 1); stains(g, w, h, 6, '#4a4030', 2); }, [3, 2]);
+T.hallWall = tex(64, 64, (g, w, h) => {
+  noise(g, w, h, 0x7a5a48, 16, 3);
+  g.fillStyle = 'rgba(60,30,20,0.35)'; for (let x = 0; x < w; x += 8) g.fillRect(x, 0, 3, h);
+  stains(g, w, h, 6, '#2a1a10', 4);
+}, [4, 2]);
+T.carpet = tex(64, 64, (g, w, h) => { noise(g, w, h, 0x3a2f3c, 36, 5); stains(g, w, h, 4, '#140a14', 6); }, [4, 4]);
+T.wood = tex(64, 64, (g, w, h) => {
+  noise(g, w, h, 0x5a3a22, 25, 7); g.fillStyle = '#2a1a0c'; for (let y = 0; y < h; y += 8) g.fillRect(0, y, w, 1);
+}, [2, 6]);
+T.ceiling = tex(32, 32, (g, w, h) => { noise(g, w, h, 0x6a665e, 14, 8); stains(g, w, h, 3, '#3a3020', 9); }, [3, 3]);
+T.corrWall = tex(64, 64, (g, w, h) => {
+  noise(g, w, h, 0x7d8a6e, 16, 10);
+  g.fillStyle = 'rgba(30,40,30,0.5)'; for (let y = 0; y < h; y += 16) g.fillRect(0, y, w, 1); for (let x = 0; x < w; x += 16) g.fillRect(x, 0, 1, h);
+  g.fillStyle = 'rgba(40,60,40,0.6)'; g.fillRect(0, h - 18, w, 18);
+  stains(g, w, h, 8, '#20301a', 11);
+}, [8, 2]);
+T.linoleum = tex(32, 32, (g, w, h) => {
+  for (let y = 0; y < h; y += 8) for (let x = 0; x < w; x += 8) { g.fillStyle = ((x + y) / 8) % 2 ? '#2a2e2a' : '#8a8c80'; g.fillRect(x, y, 8, 8); }
+  stains(g, w, h, 6, '#000', 12);
+}, [6, 40]);
+T.door = tex(32, 64, (g, w, h) => {
+  noise(g, w, h, 0x6a4024, 18, 13);
+  g.strokeStyle = '#3a2010'; g.lineWidth = 2; g.strokeRect(5, 6, 22, 22); g.strokeRect(5, 34, 22, 24);
+});
+T.doorGreen = tex(32, 64, (g, w, h) => {
+  noise(g, w, h, 0x3a5040, 16, 14);
+  g.strokeStyle = '#1a2a20'; g.lineWidth = 2; g.strokeRect(5, 6, 22, 22); g.strokeRect(5, 34, 22, 24);
+});
+T.city = tex(64, 64, (g, w, h) => {
+  const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, '#120a2a'); gr.addColorStop(1, '#3a0f3a'); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  const r = rng(15);
+  for (let i = 0; i < 14; i++) {
+    const bw = 4 + r() * 8, bh = 14 + r() * 40, x = r() * w;
+    g.fillStyle = '#06040c'; g.fillRect(x, h - bh, bw, bh);
+    for (let y = h - bh + 2; y < h; y += 3) for (let xx = x + 1; xx < x + bw - 1; xx += 2)
+      if (r() < 0.3) { g.fillStyle = ['#ff3cc8', '#3cf0ff', '#ffd040', '#b06cff'][Math.floor(r() * 4)]; g.fillRect(xx, y, 1, 1); }
+  }
+});
+T.shirt = tex(16, 16, (g, w, h) => noise(g, w, h, 0xc99a22, 26, 16), [2, 2]);
+T.pants = tex(16, 16, (g, w, h) => noise(g, w, h, 0x2a2c34, 22, 17), [2, 2]);
+T.blanket = tex(32, 32, (g, w, h) => {
+  g.fillStyle = '#3a1a4a'; g.fillRect(0, 0, w, h);
+  g.fillStyle = 'rgba(255,90,200,0.35)'; for (let i = 0; i < w; i += 8) { g.fillRect(i, 0, 2, h); g.fillRect(0, i, w, 2); }
+}, [2, 3]);
+T.checker = tex(16, 16, (g, w, h) => { for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) { g.fillStyle = ((x + y) / 4) % 2 ? '#000' : '#ff00c8'; g.fillRect(x, y, 4, 4); } }, [3, 3]);
+T.plate = tex(32, 16, (g, w, h) => { g.fillStyle = '#c8b060'; g.fillRect(0, 0, w, h); g.fillStyle = '#201808'; g.font = 'bold 13px sans-serif'; g.textAlign = 'center'; g.fillText('33', w / 2, 13); });
+T.plate2 = tex(32, 16, (g, w, h) => { g.fillStyle = '#c8b060'; g.fillRect(0, 0, w, h); g.fillStyle = '#201808'; g.font = 'bold 13px sans-serif'; g.textAlign = 'center'; g.fillText('34', w / 2, 13); });
+
+// rostos (esfera: frente em u = 0.25 -> x = 32)
+function face(kind) {
+  return tex(128, 64, (g, w, h) => {
+    g.fillStyle = kind === 'smile' || kind === 'smile2' ? '#c9a48a' : '#c8906c'; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#1a120c'; g.fillRect(0, 0, w, 15); for (let x = 0; x < w; x += 3) g.fillRect(x, 15, 3, 1 + ((x * 5) % 4));
+    g.fillRect(64, 15, 64, 26);
+    const cx = 32;
+    g.fillStyle = 'rgba(60,40,30,0.35)'; g.fillRect(cx - 14, 40, 28, 12); // barba por fazer
+    if (kind === 'normal' || kind === 'cry') {
+      const wide = kind === 'cry' ? 1 : 0;
+      g.fillStyle = '#f2ede4'; g.fillRect(cx - 9, 27 - wide, 6, 3 + wide * 2); g.fillRect(cx + 3, 27 - wide, 6, 3 + wide * 2);
+      g.fillStyle = '#2a1a0e'; g.fillRect(cx - 7, 27, 2, 3); g.fillRect(cx + 5, 27, 2, 3);
+      g.fillStyle = '#1a120c';
+      if (kind === 'cry') { g.fillRect(cx - 10, 23, 7, 1); g.fillRect(cx - 9, 22, 3, 1); g.fillRect(cx + 3, 23, 7, 1); g.fillRect(cx + 6, 22, 3, 1); }
+      else { g.fillRect(cx - 10, 24, 7, 1); g.fillRect(cx + 3, 24, 7, 1); }
+      g.fillStyle = '#9a6448'; g.fillRect(cx - 1, 31, 2, 5); g.fillRect(cx - 2, 35, 4, 1);
+      if (kind === 'cry') {
+        g.fillStyle = '#4a1a14'; g.beginPath(); g.ellipse(cx, 42, 4, 3, 0, 0, 7); g.fill();          // boca aberta de pavor
+        g.fillStyle = 'rgba(150,200,255,0.8)'; g.fillRect(cx - 7, 30, 1, 10); g.fillRect(cx + 6, 30, 1, 12); // lágrimas
+        g.fillStyle = 'rgba(160,40,40,0.5)'; g.fillRect(cx - 9, 30, 6, 1); g.fillRect(cx + 3, 30, 6, 1);
+      } else { g.fillStyle = '#6a3424'; g.fillRect(cx - 4, 41, 8, 1); }
+    } else {
+      // a CÓPIA: olhos afastados e arregalados, sorriso de orelha a orelha
+      const big = kind === 'smile2';
+      g.fillStyle = '#f6f2ea'; g.beginPath(); g.ellipse(cx - 10, 27, 4.5, big ? 4 : 3.4, 0, 0, 7); g.fill(); g.beginPath(); g.ellipse(cx + 10, 27, 4.5, big ? 4 : 3.4, 0, 0, 7); g.fill();
+      g.fillStyle = '#000'; g.fillRect(cx - 10, 27, 1, 1); g.fillRect(cx + 10, 26, 1, 1);
+      g.fillStyle = 'rgba(80,20,40,0.5)'; g.fillRect(cx - 15, 31, 10, 2); g.fillRect(cx + 5, 31, 10, 2);
+      g.fillStyle = '#1a120c'; g.fillRect(cx - 15, 21, 9, 1); g.fillRect(cx + 6, 21, 9, 1);
+      g.fillStyle = '#9a7458'; g.fillRect(cx - 1, 31, 2, 4);
+      const mw = big ? 26 : 22, my = 40, mh = big ? 9 : 5;
+      g.fillStyle = '#300606'; g.beginPath(); g.moveTo(cx - mw, my - 6); g.quadraticCurveTo(cx, my + mh + 6, cx + mw, my - 6); g.quadraticCurveTo(cx, my + 2, cx - mw, my - 6); g.fill();
+      g.fillStyle = '#efe8d0';
+      for (let i = -11; i <= 11; i++) {
+        const x = cx + i * (mw / 11.5), k = Math.abs(i) / 11, y = my - 6 + (1 - k * k) * (mh * 0.55 + 4);
+        g.fillRect(Math.round(x), Math.round(y) - 1, 1, 2); g.fillRect(Math.round(x), Math.round(y) + (big ? 4 : 2), 1, 2);
+      }
+      g.strokeStyle = 'rgba(90,40,30,0.7)'; g.beginPath(); g.moveTo(cx - mw - 2, my - 9); g.lineTo(cx - mw + 1, my - 5); g.moveTo(cx + mw + 2, my - 9); g.lineTo(cx + mw - 1, my - 5); g.stroke();
+    }
+  });
+}
+T.face = face('normal'); T.faceCry = face('cry'); T.faceSmile = face('smile'); T.faceSmile2 = face('smile2');
+
+// tela do celular (dinâmica)
+const phoneCanvas = document.createElement('canvas'); phoneCanvas.width = 48; phoneCanvas.height = 64;
+const pctx = phoneCanvas.getContext('2d');
+const phoneTex = new THREE.CanvasTexture(phoneCanvas);
+phoneTex.magFilter = phoneTex.minFilter = THREE.NearestFilter; phoneTex.generateMipmaps = false; phoneTex.colorSpace = THREE.SRGBColorSpace;
+function phoneScreen(mode, t) {
+  const g = pctx; g.fillStyle = mode === 'off' ? '#05070a' : '#0a2a3a'; g.fillRect(0, 0, 48, 64);
+  if (mode === 'off') { phoneTex.needsUpdate = true; return; }
+  g.fillStyle = '#9ff0ff'; g.font = 'bold 8px monospace'; g.textAlign = 'center';
+  g.fillText('03:33', 24, 9);
+  if (mode === 'call') {
+    g.fillText(Math.floor(t * 2) % 2 ? 'CHAMANDO' : '', 24, 22);
+    g.font = 'bold 13px monospace'; g.fillStyle = '#fff'; g.fillText('VOCÊ', 24, 38);
+    g.font = '7px monospace'; g.fillStyle = '#9ff0ff'; g.fillText('meu número', 24, 49);
+  } else if (mode === 'talk') {
+    g.fillText('EM LIGAÇÃO', 24, 22); g.font = 'bold 13px monospace'; g.fillStyle = '#fff'; g.fillText('VOCÊ', 24, 38);
+    g.font = '7px monospace'; g.fillStyle = '#9ff0ff'; g.fillText('00:' + String(Math.floor(t) % 60).padStart(2, '0'), 24, 49);
+  } else if (mode === 'missed') {
+    g.fillStyle = '#ff5050'; g.fillText('1 CHAMADA', 24, 24); g.fillText('PERDIDA', 24, 33);
+    g.font = 'bold 12px monospace'; g.fillStyle = '#fff'; g.fillText('VOCÊ', 24, 48); g.font = '7px monospace'; g.fillStyle = '#9ff0ff'; g.fillText('03:33', 24, 58);
+  }
+  phoneTex.needsUpdate = true;
+}
+const clockTex = tex(48, 20, (g, w, h) => { g.fillStyle = '#100204'; g.fillRect(0, 0, w, h); g.fillStyle = '#ff2a2a'; g.font = 'bold 15px monospace'; g.textAlign = 'center'; g.fillText('03:33', w / 2, 15); });
+
+// ====================================================================
+//  CENÁRIO: quarto + corredor do apartamento + corredor do prédio
+// ====================================================================
+const APT = new THREE.Group(); scene.add(APT);
+scene.background = new THREE.Color(0x000000);
+const FOG = { quarto: new THREE.Fog(0x0a0614, 3, 10), hall: new THREE.Fog(0x0a0604, 2.5, 9), corr: new THREE.Fog(0x061008, 3, 14) };
+function plane(w, h, mat, pos, rotY = 0, rotX = 0) { return mesh(new THREE.PlaneGeometry(w, h), mat, APT, pos, [rotX, rotY, 0]); }
+// parede com x constante (face para +x se dir=1)
+function wallZ(x, z0, z1, y0, y1, dir, mat) { return plane(z1 - z0, y1 - y0, mat, [x, (y0 + y1) / 2, (z0 + z1) / 2], dir > 0 ? Math.PI / 2 : -Math.PI / 2); }
+// parede com z constante (face para +z se dir=1)
+function wallX(z, x0, x1, y0, y1, dir, mat) { return plane(x1 - x0, y1 - y0, mat, [(x0 + x1) / 2, (y0 + y1) / 2, z], dir > 0 ? 0 : Math.PI); }
+function floorAt(x0, x1, z0, z1, y, mat, up = true) { return plane(x1 - x0, z1 - z0, mat, [(x0 + x1) / 2, y, (z0 + z1) / 2], 0, up ? -Math.PI / 2 : Math.PI / 2); }
+
+const mWall = L(0xffffff, T.wall), mHall = L(0xffffff, T.hallWall), mCorr = L(0xffffff, T.corrWall), mCeil = L(0xffffff, T.ceiling);
+// quarto  x[-2,2] z[-2,2] h2.6
+floorAt(-2, 2, -2, 2, 0, L(0xffffff, T.carpet)); floorAt(-2, 2, -2, 2, 2.6, mCeil, false);
+wallX(-2, -2, 2, 0, 2.6, 1, mWall); wallX(2, -2, 2, 0, 2.6, -1, mWall); wallZ(-2, -2, 2, 0, 2.6, 1, mWall);
+wallZ(2, -2, 0.7, 0, 2.6, -1, mWall); wallZ(2, 1.7, 2, 0, 2.6, -1, mWall); wallZ(2, 0.7, 1.7, 2.1, 2.6, -1, mWall);
+// janela com a cidade em neon
+mesh(new THREE.PlaneGeometry(1.2, 1.0), new THREE.MeshBasicMaterial({ map: T.city }), APT, [1.0, 1.55, -1.99]);
+mesh(new THREE.BoxGeometry(1.3, 0.06, 0.06), L(0x222222), APT, [1.0, 1.55, -1.97]);
+mesh(new THREE.BoxGeometry(0.06, 1.1, 0.06), L(0x222222), APT, [1.0, 1.55, -1.97]);
+mesh(new THREE.BoxGeometry(0.35, 1.5, 0.05), L(0x4a1838), APT, [0.25, 1.45, -1.93]);
+mesh(new THREE.BoxGeometry(0.35, 1.5, 0.05), L(0x4a1838), APT, [1.75, 1.45, -1.93]);
+// cama, criado-mudo, relógio
+mesh(new THREE.BoxGeometry(1.4, 0.35, 2.1), L(0x3a2418, T.wood), APT, [-0.9, 0.175, -0.95]);
+mesh(new THREE.BoxGeometry(1.42, 0.2, 1.7), L(0xffffff, T.blanket), APT, [-0.9, 0.45, -0.7]);
+mesh(new THREE.BoxGeometry(0.7, 0.12, 0.35), L(0xd8d0c8), APT, [-0.9, 0.5, -1.75]);
+mesh(new THREE.BoxGeometry(1.4, 0.9, 0.08), L(0x3a2418, T.wood), APT, [-0.9, 0.45, -2.0]);
+mesh(new THREE.BoxGeometry(0.45, 0.55, 0.4), L(0x4a3020, T.wood), APT, [0.1, 0.275, -1.75]);
+const clock = joint(APT, [0.22, 0.55, -1.78]);
+mesh(new THREE.BoxGeometry(0.16, 0.08, 0.07), L(0x111111), clock, [0, 0.04, 0]);
+mesh(new THREE.PlaneGeometry(0.14, 0.06), new THREE.MeshBasicMaterial({ map: clockTex }), clock, [0, 0.04, 0.036]);
+// corredor do apartamento x[2,7] z[0.5,1.9] h2.5
+floorAt(2, 7, 0.5, 1.9, 0, L(0xffffff, T.wood)); floorAt(2, 7, 0.5, 1.9, 2.5, mCeil, false);
+wallX(0.5, 2, 7, 0, 2.5, 1, mHall); wallX(1.9, 2, 7, 0, 2.5, -1, mHall);
+wallZ(7, 0.5, 0.75, 0, 2.5, -1, mHall); wallZ(7, 1.65, 1.9, 0, 2.5, -1, mHall); wallZ(7, 0.75, 1.65, 2.05, 2.5, -1, mHall);
+mesh(new THREE.BoxGeometry(0.05, 1.6, 0.05), L(0x3a2a1a), APT, [6.3, 0.8, 1.83]);           // cabideiro
+mesh(new THREE.BoxGeometry(0.4, 0.7, 0.12), L(0x2a3a5a), APT, [6.3, 1.25, 1.78]);           // casaco
+const bulbHall = mesh(new THREE.SphereGeometry(0.05, 6, 4), new THREE.MeshBasicMaterial({ color: 0xffb060 }), APT, [4.0, 2.35, 1.2]);
+// espelho de verdade (reflexo em baixa resolução)
+import('three/addons/objects/Reflector.js').then(({ Reflector }) => {
+  const mir = new Reflector(new THREE.PlaneGeometry(0.62, 1.1), { textureWidth: 120, textureHeight: 190, color: 0xa0a8a8, clipBias: 0.003 });
+  mir.position.set(4.6, 1.62, 0.515); APT.add(mir); window.MIRROR = mir; window.READY_MIRROR = true;
+});
+mesh(new THREE.BoxGeometry(0.72, 1.2, 0.02), L(0x2a1a10), APT, [4.6, 1.62, 0.505]);
+// porta da frente (dobradiça em z=1.65, abre para dentro, -x)
+const frontDoor = joint(APT, [7.0, 0, 1.65]);
+mesh(new THREE.BoxGeometry(0.05, 2.05, 0.9), L(0xffffff, T.door), frontDoor, [0, 1.025, -0.45]);
+mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.03, 8), new THREE.MeshBasicMaterial({ color: 0x050505 }), frontDoor, [-0.02, 1.62, -0.45], [0, 0, Math.PI / 2]);
+mesh(new THREE.SphereGeometry(0.03, 6, 4), L(0xc0a050), frontDoor, [-0.05, 1.0, -0.8]);
+mesh(new THREE.PlaneGeometry(0.12, 0.06), L(0xffffff, T.plate), frontDoor, [0.03, 1.85, -0.45], [0, Math.PI / 2, 0]);
+// corredor do prédio x[7,8.8] z[-6,8] h2.6
+floorAt(7, 8.8, -6, 8, 0, L(0xffffff, T.linoleum)); floorAt(7, 8.8, -6, 8, 2.6, mCeil, false);
+wallZ(7, -6, 0.75, 0, 2.6, 1, mCorr); wallZ(7, 1.65, 8, 0, 2.6, 1, mCorr); wallZ(7, 0.75, 1.65, 2.05, 2.6, 1, mCorr);
+wallZ(8.8, -6, 8, 0, 2.6, -1, mCorr); wallX(-6, 7, 8.8, 0, 2.6, 1, mCorr); wallX(8, 7, 8.8, 0, 2.6, -1, mCorr);
+for (const z of [-3.5, 1.2, 5.5]) {
+  mesh(new THREE.BoxGeometry(0.05, 2.05, 0.9), L(0xffffff, T.doorGreen), APT, [8.78, 1.025, z]);
+  mesh(new THREE.PlaneGeometry(0.12, 0.06), L(0xffffff, T.plate2), APT, [8.75, 1.85, z], [0, -Math.PI / 2, 0]);
+}
+const tubes = [];
+for (const z of [-3.5, 1.2, 5.5]) tubes.push(mesh(new THREE.BoxGeometry(0.12, 0.04, 1.2), new THREE.MeshBasicMaterial({ color: 0xd8ffe0 }), APT, [7.9, 2.57, z]));
+
+// luzes
+const amb = new THREE.AmbientLight(0x3a3060, 1.6); APT.add(amb);
+const neon = new THREE.PointLight(0xff3cc8, 5, 7, 1.5); neon.position.set(1.0, 1.6, -1.4); APT.add(neon);
+const neon2 = new THREE.PointLight(0x3cc8ff, 2.5, 6, 1.5); neon2.position.set(1.3, 2.0, -1.0); APT.add(neon2);
+const clockLight = new THREE.PointLight(0xff2020, 1.2, 1.5, 2); clockLight.position.set(0.22, 0.7, -1.5); APT.add(clockLight);
+const phoneLight = new THREE.PointLight(0x60e0ff, 0, 1.6, 2); APT.add(phoneLight);
+const hallLight = new THREE.PointLight(0xffa040, 4, 6, 1.6); hallLight.position.set(4.0, 2.2, 1.2); APT.add(hallLight);
+const corrLights = [-3.5, 1.2, 5.5].map((z) => { const l = new THREE.PointLight(0x9fffb0, 4, 7, 1.5); l.position.set(7.9, 2.4, z); APT.add(l); return l; });
+const redLight = new THREE.PointLight(0xff1010, 0, 4, 1.5); APT.add(redLight);
+
+// ====================================================================
+//  PERSONAGENS
+// ====================================================================
+function makePerson(faceTex, opts = {}) {
+  const m = { shirt: L(0xffffff, T.shirt), pants: L(0xffffff, T.pants), skin: L(0xc8906c), shoe: L(0x1a1a1a), hair: L(0x1a120c),
+              face: L(0xffffff, faceTex, { emissive: opts.glow || 0x000000 }) };
+  const root = new THREE.Group(); APT.add(root);
+  const hipH = 0.92, armK = opts.arm || 1;
+  const hips = joint(root, [0, hipH, 0]);
+  mesh(new THREE.BoxGeometry(0.34, 0.18, 0.2), m.pants, hips);
+  const k = { root, hips, hipH, mats: m, fingers: [] };
+  for (const [s, n] of [[1, 'l'], [-1, 'r']]) {
+    const hip = joint(hips, [0.095 * s, -0.05, 0]); limb(hip, 0.44, 0.085, 0.065, m.pants);
+    const knee = joint(hip, [0, -0.44, 0]); limb(knee, 0.42, 0.062, 0.048, m.pants);
+    const ankle = joint(knee, [0, -0.42, 0]); mesh(new THREE.BoxGeometry(0.11, 0.08, 0.27), m.shoe, ankle, [0, -0.03, 0.06]);
+    k[n] = { hip, knee, ankle };
+  }
+  const spine = joint(hips, [0, 0.06, 0]); k.spine = spine;
+  const tg = new THREE.CylinderGeometry(0.2, 0.17, 0.56, 8); tg.translate(0, 0.28, 0);
+  mesh(tg, m.shirt, spine, null, null, [1, 1, 0.62]);
+  const neck = joint(spine, [0, 0.56, 0]); k.neck = neck;
+  const nl = opts.neck || 0.09;
+  limb(neck, nl + 0.02, 0.055, 0.05, m.skin).position.y = nl;
+  const head = joint(neck, [0, nl - 0.01, 0]); k.head = head;
+  mesh(new THREE.SphereGeometry(0.118, 12, 10), m.face, head, [0, 0.13, 0], null, [0.92, 1.1, 1]);
+  mesh(new THREE.SphereGeometry(0.125, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.4), m.hair, head, [0, 0.145, -0.01], [-0.25, 0, 0], [0.96, 1.05, 1.04]);
+  for (const s of [-1, 1]) mesh(new THREE.SphereGeometry(0.028, 6, 4), m.skin, head, [0.108 * s, 0.12, 0], null, [0.5, 1, 0.8]);
+  for (const [s, n] of [[1, 'l'], [-1, 'r']]) {
+    const sh = joint(spine, [0.225 * s, 0.5, 0]);
+    mesh(new THREE.SphereGeometry(0.065, 6, 5), m.shirt, sh);
+    limb(sh, 0.16, 0.066, 0.058, m.shirt); limb(sh, 0.3 * armK, 0.05, 0.045, m.skin);
+    const el = joint(sh, [0, -0.3 * armK, 0]); limb(el, 0.27 * armK, 0.045, 0.038, m.skin);
+    const wr = joint(el, [0, -0.27 * armK, 0]);
+    mesh(new THREE.BoxGeometry(0.035, 0.08, 0.075), m.skin, wr, [0, -0.04, 0]);
+    for (let f = 0; f < 4; f++) {
+      const fb = joint(wr, [0, -0.08, 0.028 - f * 0.019]);
+      limb(fb, 0.07, 0.009, 0.007, m.skin, 4); k.fingers.push(fb);
+    }
+    const th = joint(wr, [-0.012 * s, -0.04, 0.04]); th.rotation.set(0.5, 0, -0.4 * s); limb(th, 0.05, 0.01, 0.008, m.skin, 4); k.fingers.push(th);
+    k[n].sh = sh; k[n].el = el; k[n].wr = wr;
+  }
+  return k;
+}
+function reset(k) {
+  for (const n of ['l', 'r']) for (const j of Object.values(k[n])) j.rotation.set(0, 0, 0);
+  k.spine.rotation.set(0, 0, 0); k.neck.rotation.set(0, 0, 0); k.head.rotation.set(0, 0, 0); k.hips.rotation.set(0, 0, 0);
+  k.hips.position.set(0, k.hipH, 0); k.fingers.forEach((f, i) => { if (i % 5 !== 4) { f.rotation.set(0, 0, 0); f.scale.set(1, 1, 1); } });
+  k.root.rotation.set(0, 0, 0);
+}
+function stand(k, t = 0) {
+  reset(k); k.hips.position.y = k.hipH + Math.sin(t * 2) * 0.004;
+  k.l.sh.rotation.z = 0.08; k.r.sh.rotation.z = -0.08; k.l.el.rotation.x = -0.15; k.r.el.rotation.x = -0.15;
+}
+function walk(k, ph) {
+  reset(k); const s = Math.sin(ph), c = Math.cos(ph);
+  k.hips.position.y = k.hipH + Math.abs(c) * 0.025;
+  k.l.hip.rotation.x = -s * 0.42; k.r.hip.rotation.x = s * 0.42;
+  k.l.knee.rotation.x = Math.max(0, s) * 0.7 + 0.05; k.r.knee.rotation.x = Math.max(0, -s) * 0.7 + 0.05;
+  k.l.sh.rotation.x = s * 0.3; k.r.sh.rotation.x = -s * 0.3; k.l.sh.rotation.z = 0.08; k.r.sh.rotation.z = -0.08;
+  k.spine.rotation.x = 0.05;
+}
+function phoneArm(k) { // celular no ouvido (braço direito)
+  k.r.sh.rotation.set(-0.35, 0, -0.42); k.r.el.rotation.set(-2.45, 0, 0); k.r.wr.rotation.set(0.2, 0.9, 0.2);
+}
+function lie(k, t) {
+  reset(k); k.root.rotation.x = -Math.PI / 2;
+  k.l.sh.rotation.z = 0.12; k.r.sh.rotation.z = -0.12; k.head.rotation.x = 0.15 + Math.sin(t * 1.3) * 0.02;
+}
+function sitEdge(k) {
+  reset(k); k.hips.position.y = 0.55;
+  for (const [n, s] of [['l', 1], ['r', -1]]) { k[n].hip.rotation.set(-1.5, 0, 0.08 * s); k[n].knee.rotation.x = 1.55; }
+  k.spine.rotation.x = 0.22; k.l.sh.rotation.set(-0.3, 0, 0.1); k.l.el.rotation.x = -0.6;
+}
+
+const you = makePerson(T.face);                              // VOCÊ (achava que era o original)
+const copy = makePerson(T.faceSmile, { neck: 0.16, arm: 1.12 }); // a CÓPIA (o que você realmente é)
+const orig = makePerson(T.faceCry);                          // o original, do lado de fora
+// celular de flip
+const phone = new THREE.Group(); APT.add(phone);
+mesh(new THREE.BoxGeometry(0.05, 0.095, 0.017), L(0x2a2c30), phone, [0, -0.0475, 0]);
+const lid = joint(phone, [0, 0, -0.008]);
+mesh(new THREE.BoxGeometry(0.05, 0.09, 0.012), L(0x3a3c44), lid, [0, 0.045, 0.006]);
+mesh(new THREE.PlaneGeometry(0.04, 0.054), new THREE.MeshBasicMaterial({ map: phoneTex }), lid, [0, 0.05, 0.0125]);
+mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.03, 5), L(0x111111), lid, [0.018, 0.1, 0.006]);
+
+function phoneOn(parent, pos, rot) { parent.add(phone); phone.position.set(...pos); phone.rotation.set(...rot); }
+function phoneInHand(k) { phoneOn(k.r.wr, [0, -0.07, 0.03], [0.1, Math.PI / 2, 0.15]); lid.rotation.x = -0.25; }
+
+// ====================================================================
+//  Fisheye (olho mágico) aplicado na imagem de baixa resolução
+// ====================================================================
+const fishSrc = new Uint8ClampedArray(W * H * 4);
+function fisheye(d, amt) {
+  fishSrc.set(d);
+  const cx = W / 2, cy = H * 0.45, R = W * 0.47;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const dx = (x - cx) / R, dy = (y - cy) / R, r = Math.sqrt(dx * dx + dy * dy), i = (y * W + x) * 4;
+    if (r > 1) { const ring = r < 1.04 ? 40 : 0; d[i] = d[i + 1] = d[i + 2] = ring; continue; }
+    const rs = Math.pow(r, 1 + 0.6 * amt) / (r || 1) * 1.15;
+    const sx = Math.round(cx + dx * rs * R), sy = Math.round(cy + dy * rs * R);
+    const j = (clamp(sy, 0, H - 1) * W + clamp(sx, 0, W - 1)) * 4, v = 1 - r * r * 0.5;
+    d[i] = fishSrc[j] * v; d[i + 1] = fishSrc[j + 1] * v; d[i + 2] = fishSrc[j + 2] * v;
+  }
+}
+
+// ====================================================================
+//  ROTEIRO
+// ====================================================================
+const A = (x, y, z) => new THREE.Vector3(x, y, z);
+function defaults(t) {
+  for (const k of [you, copy, orig]) k.root.visible = false;
+  frontDoor.rotation.y = 0; phoneLight.intensity = 0; redLight.intensity = 0;
+  neon.intensity = 5; neon2.intensity = 2.5; amb.intensity = 1.6; amb.color.set(0x3a3060);
+  hallLight.intensity = 4; hallLight.position.set(4.0, 2.2, 1.2); bulbHall.visible = true;
+  corrLights.forEach((l) => (l.intensity = 4)); tubes.forEach((m) => (m.visible = true));
+  you.mats.face.map = T.face; copy.mats.face.map = T.faceSmile;
+  camera.near = 0.05; camera.fov = 55; camera.updateProjectionMatrix();
+  if (window.MIRROR) window.MIRROR.visible = true;
+  lid.rotation.x = -2.6;
+}
+function buzz(t) { return Math.floor(t * 2.2) % 3 !== 2 ? Math.sin(t * 120) * 0.004 : 0; } // celular vibrando
+function phoneOnStand(t) { phoneOn(APT, [-0.02 + buzz(t), 0.56, -1.62], [-Math.PI / 2, 0, 0.3]); lid.rotation.x = 0; }
+const phoneUp = () => wpos(phone, [0, 1, 0]).sub(wpos(phone)).normalize();
+const finishFx = (o) => o;
+
+function sceneHook(t, f) {
+  defaults(t); scene.fog = FOG.quarto;
+  const flash = t > M.flash && t < M.flash + 0.35;
+  if (flash) {
+    // relance: a cópia sorrindo no corredor, luz vermelha
+    scene.fog = FOG.hall; copy.root.visible = true; stand(copy, t);
+    copy.root.position.set(4.6, 0, 1.2); copy.root.rotation.y = Math.PI / 2; copy.mats.face.map = T.faceSmile2;
+    redLight.position.set(5.2, 1.8, 1.5); redLight.intensity = 9; hallLight.intensity = 0.3;
+    const hp = wpos(copy.head, [0, 0.13, 0]);
+    camAt(camera, hp.clone().add(A(0.7, -0.03, 0.02)), hp, 0.02, f);
+    renderer.render(scene, camera);
+    post({ tint: [1.25, 0.8, 0.8], grain: 24, glitch: 0.45, zoom: 1.05 }, f); return;
+  }
+  phoneScreen('call', t); phoneOnStand(t);
+  phoneLight.position.set(0, 0.75, -1.6); phoneLight.intensity = 1.8 + Math.sin(t * 8) * 0.6;
+  const k = ease(t / 5.5), pp = wpos(phone, [0, 0.03, 0]);
+  camAt(camera, pp.clone().add(A(0.01, lerp(0.24, 0.15, k), 0.01)), pp, 0.003, f, phoneUp());
+  renderer.render(scene, camera);
+  const punch = t < 0.25 ? 1.2 - t * 0.8 : 1;
+  post({ tint: [1.05, 0.95, 1.15], grain: 14, glitch: t < 0.3 ? 0.8 : (f % 19 === 0 ? 0.4 : 0), zoom: punch, static: t < 0.15 ? 0.7 : 0 }, f);
+}
+
+function sceneQuarto(t, f) {
+  defaults(t); scene.fog = FOG.quarto;
+  you.root.visible = true;
+  if (t < M.pickup) {
+    lie(you, t); you.root.position.set(-0.85, 0.57, -0.05);
+    phoneScreen('call', t); phoneOnStand(t);
+    phoneLight.position.set(0, 0.75, -1.6); phoneLight.intensity = 1.8 + Math.sin(t * 8) * 0.6;
+    if (t < M.close) {
+      const k = ease(seg01(t, 5.5, M.close));
+      camAt(camera, A(lerp(1.6, 1.3, k), lerp(2.1, 1.75, k), lerp(1.4, 0.9, k)), A(-0.45, 0.5, -1.2));
+    } else {
+      const pp = wpos(phone, [0, 0.045, 0]);
+      camAt(camera, pp.clone().add(A(0.01, 0.16, 0.01)), pp, 0.002, f, phoneUp());  // visor de cima
+    }
+  } else {
+    // você senta e leva o celular ao ouvido
+    sitEdge(you); you.root.position.set(-0.4, 0, -0.6); you.root.rotation.y = Math.PI / 2;
+    const k = ease(seg01(t, M.pickup, M.pickup + 1.4));
+    you.r.sh.rotation.set(lerp(-0.5, -0.35, k), 0, lerp(0, -0.42, k)); you.r.el.rotation.set(lerp(-0.8, -2.45, k), 0, 0); you.r.wr.rotation.set(0.2, 0.9 * k, 0.2);
+    phoneScreen('talk', t - M.pickup); phoneInHand(you); lid.rotation.x = lerp(-2.6, -0.25, clamp(k * 3));
+    phoneLight.position.copy(wpos(phone)).sub(APT.position); phoneLight.intensity = 1.5;
+    const hp = wpos(you.head, [0, 0.13, 0]);
+    camAt(camera, A(lerp(1.4, 0.9, k), lerp(1.3, 1.25, k), lerp(0.4, 0.2, k)), hp.clone().add(A(0, -0.15, 0)));
+  }
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 0.95, 1.15], grain: 12, zoom: t > M.close && t < M.close + 0.15 ? 1.12 : 1 }, f);
+}
+
+function sceneLigacao(t, f) {
+  defaults(t); scene.fog = FOG.quarto;
+  you.root.visible = true; sitEdge(you); phoneArm(you); you.root.position.set(-0.4, 0, -0.6); you.root.rotation.y = Math.PI / 2;
+  phoneScreen('talk', t - M.pickup); phoneInHand(you);
+  phoneLight.position.copy(wpos(phone)).sub(APT.position); phoneLight.intensity = 1.6;
+  const hp = wpos(you.head, [0, 0.13, 0]);
+  let zoom = 1;
+  if (t < M.turnDoor) {
+    const k = ease(seg01(t, 17, M.turnDoor));
+    // close no rosto, iluminado pelo celular e pelo neon
+    camAt(camera, hp.clone().add(A(lerp(0.75, 0.48, k), lerp(-0.02, 0.0, k), lerp(-0.25, -0.12, k))), hp.clone().add(A(0, -0.03, 0)), 0.002, f);
+    if (t > M.punch && t < M.punch + 2) zoom = 1 + 0.18 * Math.exp(-(t - M.punch) * 3);
+    you.neck.rotation.y = 0;
+  } else {
+    // a cabeça vira devagar para a porta do quarto... o corredor escuro
+    const k = ease(seg01(t, M.turnDoor, M.turnDoor + 2));
+    you.neck.rotation.y = -0.9 * k;
+    const k2 = ease(seg01(t, M.turnDoor + 1, 30.6));
+    camAt(camera, A(lerp(-0.2, 0.6, k2), lerp(1.3, 1.5, k2), lerp(0.2, 0.6, k2)), A(lerp(1.0, 4.5, k2), 1.3, 1.2));
+    hallLight.intensity = 5 + Math.sin(t * 23) * 1.5;
+  }
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 0.95, 1.15], grain: 12, zoom, glitch: t > M.punch && t < M.punch + 0.25 ? 0.6 : 0 }, f);
+}
+
+function sceneporta(t, f) {
+  defaults(t); scene.fog = FOG.hall;
+  you.root.visible = true;
+  const fl = rng(Math.floor(t * 9))();
+  hallLight.intensity = fl < 0.18 ? 1.8 : 4.5; bulbHall.visible = fl >= 0.18;
+  if (t < M.atDoor) {
+    const k = seg01(t, 30.6, M.atDoor);
+    const x = lerp(2.3, 6.55, k);
+    walk(you, (t - 30.6) * 5.2); phoneArm(you); you.root.position.set(x, 0, 1.2); you.root.rotation.y = Math.PI / 2;
+    // por 4 quadros o reflexo mostra o seu rosto verdadeiro
+    if (t > M.mirrorBlink && t < M.mirrorBlink + 0.15) you.mats.face.map = T.faceSmile2;
+    camAt(camera, A(x - 1.5, 1.75, 1.55), A(x + 1.0, 1.2, 1.05));
+  } else {
+    stand(you, t); phoneArm(you); you.root.position.set(6.6, 0, 1.2); you.root.rotation.y = Math.PI / 2;
+    you.spine.rotation.x = 0.12; you.neck.rotation.x = 0.1;
+    const k = ease(seg01(t, M.atDoor, 38.4));
+    you.root.visible = k < 0.35;
+    camAt(camera, A(lerp(6.0, 6.75, k), lerp(1.7, 1.63, k), lerp(1.65, 1.22, k)), A(7.0, 1.62, 1.2));
+  }
+  phoneInHand(you); phoneScreen('talk', t - M.pickup);
+  renderer.render(scene, camera);
+  post({ tint: [1.15, 0.95, 0.8], grain: 12, bright: fl < 0.18 ? 0.8 : 1.1 }, f);
+}
+
+function sceneOlho(t, f) {
+  defaults(t); scene.fog = FOG.corr;
+  camera.near = 0.01; camera.fov = 120; camera.updateProjectionMatrix();
+  const off = t > M.lightsOff && t < M.face;
+  corrLights.forEach((l, i) => (l.intensity = off ? 0 : 4 * (rng(Math.floor(t * 14) + i)() < 0.1 ? 0.3 : 1)));
+  tubes.forEach((m) => (m.visible = !off));
+  if (t >= M.face) {
+    // o original, colado na lente, chorando com o celular no ouvido
+    orig.root.visible = true; stand(orig, t); phoneArm(orig); phoneInHand(orig); phoneScreen('talk', t - M.pickup);
+    const k = ease(seg01(t, M.face, M.face + 0.18));
+    orig.root.position.set(lerp(8.1, 7.62, k), 0, 1.22); orig.root.rotation.y = -Math.PI / 2;
+    orig.spine.rotation.x = 0.25; orig.neck.rotation.x = 0.35; orig.head.rotation.z = Math.sin(t * 9) * 0.04;
+  }
+  const back = seg01(t, M.stepBack, 50.2);
+  camAt(camera, A(7.04 - back * 0.4, 1.62, 1.2), A(8.8, 1.55, 1.2), t > M.face && t < M.face + 0.6 ? 0.02 : 0.002, f);
+  renderer.render(scene, camera);
+  const scare = t >= M.face && t < M.face + 0.5;
+  post({ tint: [0.85, 1.15, 0.9], grain: off ? 30 : 14, fisheye: 1, bright: off ? 0.25 : 1, glitch: scare ? 1 : 0, flash: t >= M.face && t < M.face + 0.07 ? 0.6 : 0, zoom: scare ? 1.12 : 1 }, f);
+}
+
+function sceneMaos(t, f) {
+  defaults(t); scene.fog = FOG.hall;
+  hallLight.intensity = 3.2 + Math.sin(t * 31) * 0.8;
+  let fx = { tint: [1.15, 0.95, 0.8], grain: 12 };
+  if (t < M.hands) {
+    // você no corredor, de frente, ouvindo a última frase
+    you.root.visible = true; stand(you, t); phoneArm(you); phoneInHand(you); phoneScreen('talk', t - M.pickup);
+    you.root.position.set(6.2, 0, 1.2); you.root.rotation.y = -Math.PI / 2;
+    const hp = wpos(you.head, [0, 0.12, 0]);
+    camAt(camera, hp.clone().add(A(-0.9, -0.05, 0.12)), hp, 0.002, f);
+  } else if (t < M.mirror) {
+    // primeira pessoa: as mãos... erradas
+    you.root.visible = true; stand(you, t); you.root.position.set(6.0, 0, 1.2); you.root.rotation.y = -Math.PI / 2;
+    for (const [n, s] of [['l', 1], ['r', -1]]) { you[n].sh.rotation.set(-0.95, 0, -0.42 * s); you[n].el.rotation.set(-0.9, 0, 0); you[n].wr.rotation.set(-0.3, -1.2 * s, 0); }
+    hallLight.position.set(5.6, 1.9, 1.2); hallLight.intensity = 5;
+    phoneOn(APT, [5.8, 0.01, 1.4], [-Math.PI / 2, 0, 0.8]); lid.rotation.x = 0; phoneScreen('talk', t - M.pickup);
+    const g = seg01(t, M.hands + 0.6, M.mirror - 0.5), r = rng(Math.floor(t * 12) + 5);
+    you.fingers.forEach((fj, i) => { if (i % 5 === 4) return; fj.scale.set(1, 1 + g * (1 + r() * 2), 1); fj.rotation.z = (r() - 0.5) * g * 1.2; fj.rotation.x = -g * r() * 0.8; });
+    you.mats.skin.map = g > 0.3 && r() < 0.5 + g * 0.4 ? T.checker : null; you.mats.skin.needsUpdate = true;
+    you.head.visible = false;
+    const hp = wpos(you.neck, [0, 0.2, 0]);
+    camAt(camera, hp.clone().add(A(-0.1, 0, 0)), wpos(you.l.wr, [0, 0, 0]).lerp(wpos(you.r.wr, [0, 0, 0]), 0.5), 0.004 + g * 0.01, f);
+    fx = { tint: [1.15, 0.95, 0.8], grain: 14 + g * 20, glitch: g * 0.6 * (r() < 0.4 ? 1 : 0.3) };
+  } else {
+    // o espelho: o reflexo é a CÓPIA, sorrindo. É você.
+    copy.root.visible = true; stand(copy, t); copy.root.position.set(4.6, 0, 1.25); copy.root.rotation.y = Math.PI;
+    for (const [n, s] of [['l', 1], ['r', -1]]) copy[n].sh.rotation.set(-0.2, 0, 0.05 * s);
+    if (t > M.smileMax) { copy.mats.face.map = T.faceSmile2; const k = clamp((t - M.smileMax) / 0.4); copy.head.rotation.z = 0.35 * Math.floor(k * 3) / 3; }
+    copy.neck.rotation.x = -0.05;
+    const hp = wpos(copy.head, [0, 0.13, 0]);
+    const k = ease(seg01(t, M.mirror, M.mirror + 0.7));
+    // câmera "nos seus olhos", virando para o espelho
+    const eye = hp.clone().add(A(0, 0, -0.16));
+    const look = A(lerp(6.0, 4.6, k), lerp(1.3, hp.y - 0.05, k), lerp(1.2, 0.515, k));
+    const push = ease(seg01(t, 62.6, 66));
+    camAt(camera, eye.clone().add(A(0, 0, -0.28 * push)), look, 0.002, f);
+    camera.near = 0.01; camera.updateProjectionMatrix();
+    fx = { tint: [1.15, 0.95, 0.85], grain: 14, glitch: t > M.smileMax && t < M.smileMax + 0.4 ? 0.9 : 0, zoom: t > M.smileMax && t < M.smileMax + 0.5 ? 1.1 : 1 };
+  }
+  renderer.render(scene, camera);
+  you.mats.skin.map = null; you.mats.skin.needsUpdate = true; you.head.visible = true;
+  post(fx, f);
+}
+
+function sceneVerdade(t, f) {
+  defaults(t); scene.fog = FOG.corr;
+  hallLight.intensity = 0; bulbHall.visible = false;
+  orig.root.visible = true; stand(orig, t); phoneArm(orig); phoneInHand(orig); phoneScreen('talk', t - M.pickup);
+  const back = ease(seg01(t, M.doorOpen, M.tilt));
+  orig.root.position.set(lerp(8.0, 8.5, back), 0, 1.15); orig.root.rotation.y = -Math.PI / 2;
+  orig.spine.rotation.x = -0.1 * back; orig.head.rotation.z = Math.sin(t * 11) * 0.03;
+  frontDoor.rotation.y = 1.45 * ease(seg01(t, M.doorOpen, M.doorOpen + 2.6));
+  copy.root.visible = t > M.doorOpen; stand(copy, t); copy.root.position.set(6.55, 0, 1.2); copy.root.rotation.y = Math.PI / 2;
+  copy.mats.face.map = T.faceSmile2;
+  for (const [n, s] of [['l', 1], ['r', -1]]) { copy[n].sh.rotation.set(0.05, 0, 0.05 * s); }
+  if (t > M.tilt) copy.head.rotation.z = -0.5 * Math.floor(clamp((t - M.tilt) / 0.5) * 4) / 4;
+  redLight.position.set(6.9, 2.0, 1.2); redLight.intensity = t > M.doorOpen ? 3 : 0;
+  let fx = { tint: [0.9, 1.1, 0.9], grain: 14 };
+  if (t < M.lunge) {
+    const k = ease(seg01(t, 66.1, M.lunge));
+    // por trás do ombro do original
+    const op = wpos(orig.head, [0, 0.1, 0]);
+    camAt(camera, A(Math.min(8.7, op.x + lerp(1.1, 0.5, k)), op.y + lerp(0.15, 0.06, k), op.z + lerp(-0.55, -0.4, k)), A(7.0, 1.35, 1.2));
+  } else if (t < M.black) {
+    // a cópia avança — você ataca
+    const k = clamp((t - M.lunge) / 0.45);
+    copy.root.position.x = lerp(6.55, 7.95, ease(k));
+    copy.spine.rotation.x = 0.3; for (const n of ['l', 'r']) { copy[n].sh.rotation.x = -1.4; copy[n].el.rotation.x = -0.2; }
+    walk(copy, t * 22); copy.spine.rotation.x = 0.3; for (const n of ['l', 'r']) { copy[n].sh.rotation.x = -1.5; }
+    copy.head.rotation.z = Math.sin(t * 50) * 0.2;
+    const op = wpos(orig.head, [0, 0.1, 0]);
+    camAt(camera, op.clone().add(A(-0.1, 0, 0)), wpos(copy.head, [0, 0.12, 0]), 0.05, f);
+    headLook(copy.head, camera.position, 1, Math.sin(t * 40) * 0.3); camera.lookAt(wpos(copy.head, [0, 0.13, 0]));
+    fx = { tint: [1.3, 0.75, 0.75], grain: 30, glitch: 1, flash: t < M.lunge + 0.06 ? 0.7 : 0, zoom: 1 + k * 0.25 };
+  } else { post({ black: true }, f); return; }
+  renderer.render(scene, camera);
+  post(fx, f);
+}
+
+function sceneFinal(t, f) {
+  defaults(t); scene.fog = FOG.corr;
+  // o celular do original caído no chão do corredor
+  const missed = t < M.end;
+  phoneScreen(missed ? 'missed' : 'off', t); phoneOn(APT, [8.1, 0.012, 1.0], [-Math.PI / 2, 0, 0.6]); lid.rotation.x = 0;
+  phoneLight.position.set(8.1, 0.3, 1.0); phoneLight.intensity = 1.4;
+  corrLights.forEach((l, i) => (l.intensity = rng(Math.floor(t * 10) + i)() < 0.15 ? 0.4 : 2.5));
+  const k = ease(seg01(t, M.missed, M.naoAtende));
+  const pp = wpos(phone, [0, 0.04, 0]);
+  camAt(camera, pp.clone().add(A(lerp(0.9, 0.02, k), lerp(1.4, 0.26, k), lerp(0.7, 0.01, k))), pp, 0.002, f, phoneUp());
+  renderer.render(scene, camera);
+  if (t >= M.end) { post({ black: true }, f); return; }
+  const na = t > M.naoAtende && t < M.naoAtende + 0.5;
+  post({ tint: [0.9, 1.1, 0.95], grain: 16, glitch: na ? 1 : 0, zoom: na ? 1.15 : 1, red: t > M.naoAtende ? 0.15 : 0 }, f);
+}
+
+const SCENES = { hook: sceneHook, quarto: sceneQuarto, ligacao: sceneLigacao, porta: sceneporta, olho: sceneOlho, maos: sceneMaos, verdade: sceneVerdade, final: sceneFinal };
+window.renderAt = (t) => {
+  const f = Math.round(t * TL.fps);
+  const s0 = TL.scenes.find((s) => t >= s.t0 && t < s.t1) || TL.scenes[TL.scenes.length - 1];
+  SCENES[s0.name](t, f);
+  drawSubs(t);
+};
+window.frameJPEG = (t) => { window.renderAt(t); return out.toDataURL('image/jpeg', 0.9); };
+const waitMirror = () => (window.READY_MIRROR ? (window.READY = true) : setTimeout(waitMirror, 50));
+waitMirror();
+
+if (!window.RENDER_MODE) {
+  const btn = document.createElement('button'); btn.id = 'play'; btn.textContent = '▶ ASSISTIR'; document.body.appendChild(btn);
+  btn.onclick = () => {
+    btn.remove();
+    const audio = new Audio('saida/audio.wav'); audio.play().catch(() => {});
+    const start = performance.now();
+    const loop = () => { const t = audio.currentTime > 0 ? audio.currentTime : (performance.now() - start) / 1000; if (t < TL.duration) { window.renderAt(t); requestAnimationFrame(loop); } };
+    loop();
+  };
+}
+</script>
+</body>
+</html>
