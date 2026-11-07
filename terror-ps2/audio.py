@@ -125,7 +125,7 @@ def footstep_wood(st, g=0.5):
 
 def blips():
     for s in TL["subs"]:
-        cps = 22 if s["kind"] == "big" else 30
+        cps = s.get("cps") or (22 if s["kind"] == "big" else 30)
         freq = 520 if s["kind"] == "big" else 1250
         txt = s["text"]
         for i, ch in enumerate(txt):
@@ -133,7 +133,7 @@ def blips():
             if st > s["t1"] or ch == " " or i % 2: continue
             tt = t_(0.014)
             b = np.sign(np.sin(2 * np.pi * freq * tt)) * env(len(tt), 0.001, 0.006)
-            add(st, b, 0.06 if s["kind"] != "big" else 0.09)
+            add(st, b, 0.03 if s["kind"] != "big" else 0.05)
 
 
 def music_box(start, end, g=0.2):
@@ -281,14 +281,37 @@ glitch(76.9, 0.2, 0.3)
 for k in range(8): crack(M["monsterTurn"] + 0.3 + k * 0.375, 0.35)
 glitch(85.5, 0.5, 0.3)
 boom(M["connected"], 0.9, 45); glitch(M["connected"], 0.5, 0.45); growl(M["connected"], 2.4, 0.45)
-static_burst(89.85, 0.15, 0.3)
+static_burst(DUR - 0.15, 0.15, 0.3)
 
 # corte seco para o silêncio após o susto e no fim
 tt = np.arange(N) / SR
-mute = ((tt >= M["black"]) & (tt < 74.0)) | ((tt >= M["end"]) & (tt < 89.85))
+mute = ((tt >= M["black"]) & (tt < 74.0)) | ((tt >= M["end"]) & (tt < DUR - 0.15))
 L[mute] *= 0.0; R[mute] *= 0.0
 
-mix = np.stack([L, R], 1)
+# ---------------- narração (voz) com "ducking" da trilha ----------------
+VO_DIR = os.path.join(HERE, "saida", "narracao")
+tempos = os.path.join(VO_DIR, "tempos.json")
+if os.path.exists(tempos):
+    V = np.zeros(N)
+    for item in json.load(open(tempos)):
+        with wave.open(os.path.join(VO_DIR, item["file"])) as w:
+            v = np.frombuffer(w.readframes(w.getnframes()), "<i2") / 32768.0
+        i = int(item["start"] * SR); v = v[: max(0, N - i)]
+        V[i:i + len(v)] += v
+    V = filt(V, 70, None, 2)
+    # ambiência leve: algumas reflexões curtas
+    wet = np.zeros(N)
+    for d, g in [(0.031, 0.18), (0.047, 0.14), (0.073, 0.1), (0.11, 0.06)]:
+        k = int(d * SR); wet[k:] += V[:-k] * g
+    V = V + filt(wet, 200, 4000)
+    lvl = np.convolve(np.abs(V), np.ones(4410) / 4410, "same")
+    duck = 1 - 0.55 * np.clip(lvl / (np.percentile(lvl[lvl > 1e-4], 50) + 1e-9), 0, 1)
+    music = np.stack([L * duck, R * duck], 1)
+    music /= (np.percentile(np.abs(music), 99.95) + 1e-9)
+    V = V / (np.max(np.abs(V)) + 1e-9) * 0.95
+    mix = music * 0.75 + np.stack([V, V], 1)
+else:
+    mix = np.stack([L, R], 1)
 mix = np.tanh(1.3 * mix / (np.percentile(np.abs(mix), 99.95) + 1e-9)) * 0.95  # compressão suave dos picos
 os.makedirs(os.path.join(HERE, "saida"), exist_ok=True)
 out = os.path.join(HERE, "saida", "audio.wav")

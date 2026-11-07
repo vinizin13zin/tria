@@ -689,7 +689,7 @@ function wrap(ctx, text, maxW) {
 function drawSubs(t) {
   for (const s of TL.subs) {
     if (t < s.t0 || t > s.t1) continue;
-    const cps = s.kind === 'big' ? 22 : 30;
+    const cps = s.cps || (s.kind === 'big' ? 22 : 30);
     const n = Math.floor((t - s.t0) * cps);
     const alpha = clamp((s.t1 - t) / 0.25);
     const size = s.kind === 'big' ? 64 : s.kind === 'end' ? 46 : 46;
@@ -707,7 +707,7 @@ function drawSubs(t) {
         if (vis) {
           const red = s.kind === 'big' || (word.replace(/[^A-ZÇÃÉÍÓÚÂÊÔ]/g, '').length >= 3 && word === word.toUpperCase());
           octx.lineWidth = 10; octx.lineJoin = 'round'; octx.strokeStyle = '#000'; octx.strokeText(vis, x, y0);
-          octx.fillStyle = red ? '#ff2a2a' : (s.kind === 'end' ? '#bbb' : '#fff'); octx.fillText(vis, x, y0);
+          octx.fillStyle = red ? '#ff2a2a' : (s.kind === 'end' ? '#e6e6e6' : '#fff'); octx.fillText(vis, x, y0);
         }
         x += octx.measureText(word + ' ').width;
       }
