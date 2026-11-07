@@ -1,6 +1,8 @@
 # O JOGADOR — curta de terror estilo PS2 (1min30, vertical 9:16)
 
-Vídeo final: [`saida/o_jogador.mp4`](saida/o_jogador.mp4) — 720×1280, 30 fps, 90 s, pronto para TikTok / Reels / Shorts.
+Vídeo final: [`saida/o_jogador.mp4`](saida/o_jogador.mp4) — 720×1280, 30 fps, 93 s, narrado, pronto para TikTok / Reels / Shorts.
+
+Narração em segunda pessoa, voz masculina neural (Kokoro-82M, voz `pm_alex`, gerada offline por `voz_kokoro.py`), sincronizada com as legendas por `narracao.py`.
 
 ## A história
 
@@ -46,4 +48,6 @@ node render.js --at 41.6,71.7     # prévia de instantes específicos (saida/pre
 | `index.html` | cenas 3D (three.js), personagens, monstro, pós-processamento PS2 e legendas |
 | `render.js` | captura quadro a quadro no Chromium headless (paralelo) |
 | `audio.py` | trilha 100% sintetizada: drone, chuva, passos, cantiga de caixinha de música, batimentos, ossos estalando, grito |
+| `voz_kokoro.py` | gera as 20 falas da narração (pt-BR, masculina) |
+| `narracao.py` | encaixa cada fala na cena e ajusta o ritmo das legendas |
 | `build.sh` | junta tudo em `saida/o_jogador.mp4` |

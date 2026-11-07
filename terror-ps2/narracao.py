@@ -17,39 +17,44 @@ tl = json.loads(re.sub(r"^[^=]*=", "", open(TLP, encoding="utf8").read()).strip(
 subs = tl["subs"]
 n_lines = len(subs)
 
-raw = subprocess.run(["ffmpeg", "-v", "error", "-i", os.path.join(D, "tomada.mp3"), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
-                     capture_output=True, check=True).stdout
-x = np.frombuffer(raw, "<i2").astype(np.float64) / 32768.0
-
-# energia em janelas de 10 ms
-hop = SR // 100
-nf = len(x) // hop
-rms = np.sqrt((x[: nf * hop].reshape(nf, hop) ** 2).mean(1) + 1e-12)
-db = 20 * np.log10(rms / rms.max())
-voiced = db > -38
-runs, i = [], 0
-while i < nf:  # trechos de silêncio
-    if not voiced[i]:
-        j = i
-        while j < nf and not voiced[j]: j += 1
-        if i > 0 and j < nf: runs.append((i, j))
-        i = j
-    else: i += 1
-runs.sort(key=lambda r: r[1] - r[0], reverse=True)
-cuts = sorted(runs[: n_lines - 1])
-print("pausas usadas (s):", [round((b - a) / 100, 2) for a, b in cuts])
-bounds, prev = [], 0
-for a, b in cuts: bounds.append((prev, a)); prev = b
-bounds.append((prev, nf))
-
-def trim(a, b):
-    idx = np.where(voiced[a:b])[0]
-    return a + idx[0], a + idx[-1] + 1
+LINHAS = os.path.join(D, "linhas")
+segs = []
+if os.path.isdir(LINHAS):
+    # uma fala por arquivo (voz_kokoro.py)
+    for k in range(n_lines):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", os.path.join(LINHAS, f"{k:02d}.wav"), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                           capture_output=True, check=True).stdout
+        y = np.frombuffer(r, "<i2").astype(np.float64) / 32768.0
+        e = np.abs(y) > 0.01
+        a0, b0 = np.argmax(e), len(y) - np.argmax(e[::-1])
+        segs.append(y[max(0, a0 - 1500): b0 + 3000])
+else:
+    # tomada única (ElevenLabs): divide pelas maiores pausas
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", os.path.join(D, "tomada.mp3"), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                         capture_output=True, check=True).stdout
+    x = np.frombuffer(raw, "<i2").astype(np.float64) / 32768.0
+    hop = SR // 100
+    nf = len(x) // hop
+    rms = np.sqrt((x[: nf * hop].reshape(nf, hop) ** 2).mean(1) + 1e-12)
+    voiced = 20 * np.log10(rms / rms.max()) > -38
+    runs, i = [], 0
+    while i < nf:
+        if not voiced[i]:
+            j = i
+            while j < nf and not voiced[j]: j += 1
+            if i > 0 and j < nf: runs.append((i, j))
+            i = j
+        else: i += 1
+    runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+    prev = 0
+    for a, b in sorted(runs[: n_lines - 1]) + [(nf, nf)]:
+        idx = np.where(voiced[prev:a])[0]
+        s0, s1 = prev + idx[0], prev + idx[-1] + 1
+        segs.append(x[max(0, s0 * hop - 2205): min(len(x), s1 * hop + 4410)])
+        prev = b
 
 tempos = []
-for k, (a, b) in enumerate(bounds):
-    a, b = trim(a, b)
-    seg = x[max(0, a * hop - 2205): min(len(x), b * hop + 4410)]
+for k, seg in enumerate(segs):
     dur = len(seg) / SR
     s = subs[k]
     start = 0.15 if k == 0 else s["t0"]

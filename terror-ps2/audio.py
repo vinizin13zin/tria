@@ -3,7 +3,7 @@
 Lê os tempos de timeline.js para que legendas, cortes e sustos fiquem
 sincronizados com o vídeo. Gera saida/audio.wav (44.1 kHz, estéreo).
 """
-import json, os, re, wave
+import json, os, re, subprocess, wave
 import numpy as np
 
 SR = 44100
@@ -312,10 +312,20 @@ if os.path.exists(tempos):
     mix = music * 0.75 + np.stack([V, V], 1)
 else:
     mix = np.stack([L, R], 1)
-mix = np.tanh(1.3 * mix / (np.percentile(np.abs(mix), 99.95) + 1e-9)) * 0.95  # compressão suave dos picos
+mix = np.tanh(mix / (np.percentile(np.abs(mix), 99.99) + 1e-9))  # só arredonda os picos (susto, grito)
+mix *= 0.89 / (np.max(np.abs(mix)) + 1e-9)
 os.makedirs(os.path.join(HERE, "saida"), exist_ok=True)
 out = os.path.join(HERE, "saida", "audio.wav")
 with wave.open(out, "wb") as w:
     w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR)
     w.writeframes((mix * 32767).astype("<i2").tobytes())
 print("ok", out)
+
+# volume final: ~-14 LUFS (padrão de redes sociais), pico <= -1 dBFS
+meas = subprocess.run(["ffmpeg", "-nostats", "-i", out, "-af", "ebur128", "-f", "null", "-"], capture_output=True, text=True).stderr
+lufs = float(re.findall(r"I:\s+(-?[\d.]+) LUFS", meas)[-1])
+g = min(10 ** ((-14 - lufs) / 20), 0.89 / (np.max(np.abs(mix)) + 1e-9))
+with wave.open(out, "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR)
+    w.writeframes((mix * g * 32767).astype("<i2").tobytes())
+print("loudness %.1f LUFS -> ganho %.2f" % (lufs, g))
