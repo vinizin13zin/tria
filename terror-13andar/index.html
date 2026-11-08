@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>13º Andar</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #out { display: block; height: 100vh; margin: 0 auto; image-rendering: pixelated; }
+  #play { position: fixed; inset: 0; margin: auto; width: 180px; height: 56px; font: bold 18px sans-serif;
+          background: #b00; color: #fff; border: 0; border-radius: 8px; cursor: pointer; }
+</style>
+<script src="timeline.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="out" width="720" height="1280"></canvas>
+<script type="module">
+import * as THREE from 'three';
+
+// ====================================================================
+//  Configuração geral — visual estilo PS2
+// ====================================================================
+const TL = window.TL, M = TL.marks;
+const W = 240, H = 426;           // resolução interna (baixa, 9:16)
+const OW = 720, OH = 1280;        // saída (x3, vizinho mais próximo)
+const TVW = 128, TVH = 96;        // resolução da "tela" do CRT
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, W / H, 0.05, 200);
+
+// --- RNG determinístico (cada quadro é sempre igual) ---
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const ease = (k) => { k = clamp(k); return k * k * (3 - 2 * k); };
+const seg01 = (t, a, b) => clamp((t - a) / (b - a));
+const step = (t, fps) => Math.floor(t * fps) / fps; // movimento "travado"
+
+// --- tremor de vértices (snap em espaço de tela, típico do PS2) ---
+const snapU = { value: new THREE.Vector2(W / 2, H / 2) };
+function ps2(mat) {
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uSnap = snapU;
+    sh.vertexShader = 'uniform vec2 uSnap;\n' + sh.vertexShader.replace('#include <project_vertex>',
+      '#include <project_vertex>\n  gl_Position.xy = floor(gl_Position.xy / gl_Position.w * uSnap + 0.5) / uSnap * gl_Position.w;');
+  };
+  return mat;
+}
+const L = (color, map, extra = {}) => ps2(new THREE.MeshLambertMaterial({ color, map: map || null, ...extra }));
+
+// --- texturas procedurais de baixa resolução ---
+function tex(w, h, draw, repeat) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d'); draw(g, w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
+  t.colorSpace = THREE.SRGBColorSpace;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat[0], repeat[1]); }
+  t.userData.canvas = c;
+  return t;
+}
+function noise(g, w, h, base, amt, seed = 1) {
+  const r = rng(seed), d = g.getImageData(0, 0, w, h);
+  const c = new THREE.Color(base);
+  for (let i = 0; i < w * h; i++) {
+    const n = (r() - 0.5) * amt;
+    d.data[i * 4] = clamp(c.r * 255 + n, 0, 255); d.data[i * 4 + 1] = clamp(c.g * 255 + n, 0, 255);
+    d.data[i * 4 + 2] = clamp(c.b * 255 + n, 0, 255); d.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(d, 0, 0);
+}
+function stains(g, w, h, n, color, seed) {
+  const r = rng(seed);
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = color; g.globalAlpha = 0.15 + r() * 0.25;
+    g.beginPath(); g.ellipse(r() * w, r() * h, 2 + r() * w * 0.15, 2 + r() * h * 0.2, r() * 3, 0, 7); g.fill();
+  }
+  g.globalAlpha = 1;
+}
+
+function mesh(geo, mat, parent, pos, rot, scale) {
+  const m = new THREE.Mesh(geo, mat);
+  if (pos) m.position.set(...pos); if (rot) m.rotation.set(...rot); if (scale) m.scale.set(...scale);
+  parent.add(m); return m;
+}
+function joint(parent, pos) { const j = new THREE.Group(); j.position.set(...pos); parent.add(j); return j; }
+function limb(parent, len, r0, r1, mat, sides = 6) {
+  const g = new THREE.CylinderGeometry(r1, r0, len, sides); g.translate(0, -len / 2, 0);
+  return mesh(g, mat, parent);
+}
+
+const tmpV = new THREE.Vector3(), UPV = new THREE.Vector3(0, 1, 0);
+function camAt(cam, p, look, shake = 0, seed = 0, up = null) {
+  cam.up.copy(up || UPV);
+  cam.position.copy(p);
+  if (shake) { const r = rng(seed); cam.position.x += (r() - 0.5) * shake; cam.position.y += (r() - 0.5) * shake; }
+  cam.lookAt(look);
+}
+const wpos = (obj, off = [0, 0, 0]) => { obj.updateWorldMatrix(true, false); return obj.localToWorld(tmpV.set(...off)).clone(); };
+// vira a cabeça (aos trancos) para encarar um ponto do mundo
+function headLook(head, target, k, tilt = 0) {
+  scene.updateMatrixWorld(true);
+  const q0 = head.quaternion.clone(); head.lookAt(target); head.rotateZ(tilt);
+  const q1 = head.quaternion.clone(); head.quaternion.slerpQuaternions(q0, q1, k);
+}
+function lerpV(a, b, k) { return new THREE.Vector3().lerpVectors(a, b, k); }
+
+// ====================================================================
+//  Pós-processamento (paleta reduzida + dithering + glitch) e textos
+// ====================================================================
+const sc = document.createElement('canvas'); sc.width = W; sc.height = H;
+const sctx = sc.getContext('2d', { willReadFrequently: true });
+const out = document.getElementById('out'), octx = out.getContext('2d');
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v / 16 - 0.5) * 10);
+const scan = document.createElement('canvas'); scan.width = OW; scan.height = OH;
+{ const g = scan.getContext('2d'); g.fillStyle = 'rgba(0,0,0,0.22)'; for (let y = 0; y < OH; y += 3) g.fillRect(0, y, OW, 1);
+  const vg = g.createRadialGradient(OW / 2, OH / 2, OH * 0.25, OW / 2, OH / 2, OH * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.75)'); g.fillStyle = vg; g.fillRect(0, 0, OW, OH); }
+
+function post(fx, frame) {
+  sctx.drawImage(renderer.domElement, 0, 0);
+  const img = sctx.getImageData(0, 0, W, H), d = img.data, r = rng(frame * 7 + 3);
+  const [tr, tg, tb] = fx.tint || [1, 1, 1];
+  const gr = fx.grain ?? 10, bright = fx.bright ?? 1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, b = BAYER[(x & 3) + ((y & 3) << 2)], n = (r() - 0.5) * gr;
+    d[i] = (clamp(d[i] * tr * bright + b + n, 0, 255) >> 3) << 3;
+    d[i + 1] = (clamp(d[i + 1] * tg * bright + b + n, 0, 255) >> 3) << 3;
+    d[i + 2] = (clamp(d[i + 2] * tb * bright + b + n, 0, 255) >> 3) << 3;
+  }
+  if (fx.fisheye) fisheye(d, fx.fisheye);
+  if (fx.gray) for (let i = 0; i < d.length; i += 4) { const v = d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11; d[i] = v * 0.88; d[i + 1] = v; d[i + 2] = v * 0.9; }
+  if (fx.static) for (let i = 0; i < d.length; i += 4) { const v = r() * 255; d[i] = lerp(d[i], v, fx.static); d[i + 1] = lerp(d[i + 1], v, fx.static); d[i + 2] = lerp(d[i + 2], v, fx.static); }
+  sctx.putImageData(img, 0, 0);
+  octx.imageSmoothingEnabled = false;
+  octx.fillStyle = '#000'; octx.fillRect(0, 0, OW, OH);
+  if (fx.black) return;
+  const z = fx.zoom || 1;
+  octx.drawImage(sc, 0, 0, W, H, OW / 2 - OW * z / 2, OH / 2 - OH * z / 2, OW * z, OH * z);
+  if (fx.glitch) {                // faixas deslocadas + separação RGB
+    const g = fx.glitch;
+    for (let k = 0; k < 6 + g * 10; k++) {
+      const y = Math.floor(r() * OH), h = 6 + Math.floor(r() * 60 * g), dx = Math.floor((r() - 0.5) * 140 * g);
+      octx.drawImage(out, 0, y, OW, h, dx, y, OW, h);
+    }
+    octx.globalCompositeOperation = 'lighter'; octx.globalAlpha = 0.35 * g;
+    octx.drawImage(sc, 0, 0, W, H, 8 * g, 0, OW, OH);
+    octx.globalAlpha = 1; octx.globalCompositeOperation = 'source-over';
+  }
+  if (fx.flash) { octx.fillStyle = `rgba(255,255,255,${fx.flash})`; octx.fillRect(0, 0, OW, OH); }
+  if (fx.red) { octx.fillStyle = `rgba(160,0,0,${fx.red})`; octx.globalCompositeOperation = 'multiply'; octx.fillRect(0, 0, OW, OH); octx.globalCompositeOperation = 'source-over'; }
+  octx.drawImage(scan, 0, 0);
+}
+
+function wrap(ctx, text, maxW) {
+  const words = text.split(' '), lines = []; let cur = '';
+  for (const w of words) { const tst = cur ? cur + ' ' + w : w; if (ctx.measureText(tst).width > maxW && cur) { lines.push(cur); cur = w; } else cur = tst; }
+  if (cur) lines.push(cur); return lines;
+}
+function drawSubs(t) {
+  for (const s of TL.subs) {
+    if (t < s.t0 || t > s.t1) continue;
+    const cps = s.cps || (s.kind === 'big' ? 22 : 30);
+    const n = Math.floor((t - s.t0) * cps);
+    const alpha = clamp((s.t1 - t) / 0.25);
+    const size = s.kind === 'big' ? 64 : s.kind === 'end' ? 46 : 46;
+    octx.font = `900 ${size}px "Liberation Sans", Arial, sans-serif`;
+    octx.textAlign = 'left'; octx.textBaseline = 'middle';
+    const lines = wrap(octx, s.text, 620);
+    const lh = size * 1.18;
+    const cy = s.kind === 'big' ? OH * 0.2 : s.kind === 'end' ? OH * 0.5 : OH * 0.70;
+    let y0 = cy - (lines.length - 1) * lh / 2, shown = 0;
+    octx.globalAlpha = alpha;
+    for (const line of lines) {
+      const fullW = octx.measureText(line).width; let x = OW / 2 - fullW / 2;
+      for (const word of line.split(' ')) {
+        const vis = word.slice(0, Math.max(0, n - shown)); shown += word.length + 1;
+        if (vis) {
+          const red = (s.kind === 'big' && s.text !== '...VOCÊ ATENDERIA?') || s.text === 'NÃO ATENDE.' || (word.replace(/[^A-ZÇÃÉÍÓÚÂÊÔ]/g, '').length >= 3 && word === word.toUpperCase());
+          octx.lineWidth = 10; octx.lineJoin = 'round'; octx.strokeStyle = '#000'; octx.strokeText(vis, x, y0);
+          octx.fillStyle = red ? '#ff2a2a' : (s.kind === 'end' ? '#e6e6e6' : s.kind === 'phone' ? '#7dffa0' : '#fff'); octx.fillText(vis, x, y0);
+        }
+        x += octx.measureText(word + ' ').width;
+      }
+      y0 += lh;
+    }
+    octx.globalAlpha = 1;
+  }
+}
+
+// ====================================================================
+//  Fisheye (olho mágico) aplicado na imagem de baixa resolução
+// ====================================================================
+const fishSrc = new Uint8ClampedArray(W * H * 4);
+function fisheye(d, amt) {
+  fishSrc.set(d);
+  const cx = W / 2, cy = H * 0.45, R = W * 0.47;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const dx = (x - cx) / R, dy = (y - cy) / R, r = Math.sqrt(dx * dx + dy * dy), i = (y * W + x) * 4;
+    if (r > 1) { const ring = r < 1.04 ? 40 : 0; d[i] = d[i + 1] = d[i + 2] = ring; continue; }
+    const rs = Math.pow(r, 1 + 0.6 * amt) / (r || 1) * 1.15;
+    const sx = Math.round(cx + dx * rs * R), sy = Math.round(cy + dy * rs * R);
+    const j = (clamp(sy, 0, H - 1) * W + clamp(sx, 0, W - 1)) * 4, v = 1 - r * r * 0.5;
+    d[i] = fishSrc[j] * v; d[i + 1] = fishSrc[j + 1] * v; d[i + 2] = fishSrc[j + 2] * v;
+  }
+}
+
+
+// ====================================================================
+//  TEXTURAS
+// ====================================================================
+const T = {};
+T.metal = tex(32, 64, (g, w, h) => {
+  noise(g, w, h, 0x8a8e92, 14, 1);
+  const r = rng(2); for (let i = 0; i < 90; i++) { g.fillStyle = `rgba(255,255,255,${0.05 + r() * 0.08})`; g.fillRect(r() * w, 0, 1, h); }
+  stains(g, w, h, 4, '#3a3a3a', 3);
+}, [2, 1]);
+T.elFloor = tex(32, 32, (g, w, h) => { noise(g, w, h, 0x2a2622, 20, 4); g.fillStyle = 'rgba(0,0,0,0.4)'; for (let i = 0; i < w; i += 4) g.fillRect(i, 0, 1, h); }, [2, 2]);
+T.corrWall = tex(64, 64, (g, w, h) => {
+  noise(g, w, h, 0x6e6458, 16, 5); g.fillStyle = 'rgba(40,30,20,0.4)'; g.fillRect(0, h - 16, w, 16);
+  g.fillStyle = 'rgba(30,20,10,0.5)'; g.fillRect(0, h - 17, w, 1); stains(g, w, h, 8, '#2a2010', 6);
+}, [6, 2]);
+T.carpetRed = tex(32, 32, (g, w, h) => {
+  noise(g, w, h, 0x4a1418, 30, 7); g.fillStyle = 'rgba(200,160,60,0.25)';
+  for (let y = 4; y < h; y += 16) for (let x = 4; x < w; x += 16) { g.fillRect(x, y, 3, 3); g.fillRect(x + 8, y + 8, 3, 3); }
+}, [2, 12]);
+T.ceil = tex(32, 32, (g, w, h) => { noise(g, w, h, 0x5e5a52, 12, 8); stains(g, w, h, 3, '#302a20', 9); }, [2, 6]);
+T.door13 = tex(32, 64, (g, w, h) => {
+  noise(g, w, h, 0x5a3a26, 16, 10); g.strokeStyle = '#2a180c'; g.lineWidth = 2; g.strokeRect(5, 6, 22, 22); g.strokeRect(5, 34, 22, 24);
+  g.fillStyle = '#c8a850'; g.fillRect(9, 2, 14, 7); g.fillStyle = '#201000'; g.font = 'bold 7px sans-serif'; g.textAlign = 'center'; g.fillText('13', 16, 8);
+});
+T.marble = tex(64, 64, (g, w, h) => {
+  noise(g, w, h, 0xd8d2c4, 14, 11); g.strokeStyle = 'rgba(120,110,100,0.35)';
+  const r = rng(12); for (let i = 0; i < 12; i++) { g.beginPath(); let x = r() * w, y = r() * h; g.moveTo(x, y); for (let k = 0; k < 6; k++) { x += (r() - 0.5) * 20; y += (r() - 0.3) * 14; g.lineTo(x, y); } g.stroke(); }
+  g.fillStyle = 'rgba(0,0,0,0.25)'; g.fillRect(0, 0, w, 1); g.fillRect(0, 0, 1, h);
+}, [6, 6]);
+T.lobbyWall = tex(64, 64, (g, w, h) => { noise(g, w, h, 0x8a6e4e, 14, 13); g.fillStyle = 'rgba(60,40,20,0.45)'; for (let x = 0; x < w; x += 16) g.fillRect(x, 0, 2, h); }, [6, 2]);
+T.jacket = tex(16, 16, (g, w, h) => noise(g, w, h, 0x2e4a3a, 24, 14), [2, 2]);
+T.jeans = tex(16, 16, (g, w, h) => noise(g, w, h, 0x2a3450, 22, 15), [2, 2]);
+T.suit = tex(16, 16, (g, w, h) => noise(g, w, h, 0x141418, 14, 16), [2, 2]);
+T.uniform = tex(16, 16, (g, w, h) => noise(g, w, h, 0x2a3a6a, 20, 17), [2, 2]);
+T.grayPants = tex(16, 16, (g, w, h) => noise(g, w, h, 0x3a3a40, 18, 18), [2, 2]);
+T.street = tex(64, 64, (g, w, h) => {
+  const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, '#0a0f22'); gr.addColorStop(1, '#1a1a2a'); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  g.fillStyle = '#ffc860'; g.fillRect(10, 30, 2, 2); g.fillRect(50, 26, 2, 2); g.fillStyle = '#05060c'; g.fillRect(0, 40, w, 24);
+});
+
+function faceTex(kind) {
+  return tex(128, 64, (g, w, h) => {
+    const skin = kind === 'blank' ? '#d6cfc6' : kind === 'old' ? '#b98463' : '#c8906c';
+    g.fillStyle = skin; g.fillRect(0, 0, w, h);
+    const cx = 32;
+    if (kind === 'blank') {
+      // SEM ROSTO: pele lisa, só sombras onde deveriam estar olhos e boca
+      g.fillStyle = '#1a1612'; g.fillRect(0, 0, w, 13); g.fillRect(64, 13, 64, 24); for (let x = 0; x < w; x += 2) g.fillRect(x, 13, 2, 1 + ((x * 7) % 3));
+      g.fillStyle = 'rgba(120,100,90,0.35)'; g.beginPath(); g.ellipse(cx - 9, 28, 5, 3, 0, 0, 7); g.fill(); g.beginPath(); g.ellipse(cx + 9, 28, 5, 3, 0, 0, 7); g.fill();
+      g.fillStyle = 'rgba(150,120,110,0.3)'; g.fillRect(cx - 5, 41, 10, 1);
+      g.fillStyle = 'rgba(255,255,255,0.12)'; g.fillRect(cx - 2, 30, 4, 7);
+      return;
+    }
+    g.fillStyle = kind === 'old' ? '#8a8a8a' : '#1a120c'; g.fillRect(0, 0, w, 14); for (let x = 0; x < w; x += 3) g.fillRect(x, 14, 3, 1 + ((x * 5) % 4)); g.fillRect(64, 14, 64, 24);
+    const scared = kind === 'scared' || kind === 'old';
+    g.fillStyle = '#f2ede4'; g.fillRect(cx - 9, 26, 6, scared ? 5 : 3); g.fillRect(cx + 3, 26, 6, scared ? 5 : 3);
+    g.fillStyle = '#2a1a0e'; g.fillRect(cx - 7, 27, 2, 2); g.fillRect(cx + 5, 27, 2, 2);
+    g.fillStyle = kind === 'old' ? '#7a7a7a' : '#1a120c'; g.fillRect(cx - 10, scared ? 22 : 23, 7, 1); g.fillRect(cx + 3, scared ? 22 : 23, 7, 1);
+    g.fillStyle = '#9a6448'; g.fillRect(cx - 1, 31, 2, 5); g.fillRect(cx - 2, 35, 4, 1);
+    if (kind === 'old') { g.fillStyle = '#6a6a6a'; g.fillRect(cx - 7, 37, 14, 3); }
+    if (scared) { g.fillStyle = '#3a1410'; g.beginPath(); g.ellipse(cx, 42, 3, 2.5, 0, 0, 7); g.fill(); }
+    else { g.fillStyle = '#6a3424'; g.fillRect(cx - 4, 41, 8, 1); }
+  });
+}
+T.face = faceTex('normal'); T.faceScared = faceTex('scared'); T.faceBlank = faceTex('blank'); T.faceOld = faceTex('old');
+
+// painel de botões e visor (dinâmicos)
+const panelCv = document.createElement('canvas'); panelCv.width = 48; panelCv.height = 96;
+const panelTex = new THREE.CanvasTexture(panelCv); panelTex.magFilter = panelTex.minFilter = THREE.NearestFilter; panelTex.generateMipmaps = false; panelTex.colorSpace = THREE.SRGBColorSpace;
+function drawPanel(show13, lit, pulse = 0) {
+  const g = panelCv.getContext('2d');
+  g.fillStyle = '#9a9ea2'; g.fillRect(0, 0, 48, 96); g.fillStyle = '#6a6e72'; g.fillRect(2, 2, 44, 92);
+  const labels = ['11', '12', '9', '10', '7', '8', '5', '6', '3', '4', '1', '2'];
+  g.font = 'bold 7px monospace'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  labels.forEach((l, i) => {
+    const x = 14 + (i % 2) * 20, y = 24 + Math.floor(i / 2) * 11;
+    g.fillStyle = lit === l ? '#ffcf60' : '#2a2c30'; g.beginPath(); g.arc(x, y, 4.5, 0, 7); g.fill();
+    g.fillStyle = lit === l ? '#000' : '#d8d8d8'; g.fillText(l, x, y + 0.5);
+  });
+  g.fillStyle = lit === 'T' ? '#ffcf60' : '#2a2c30'; g.beginPath(); g.arc(24, 89, 4.5, 0, 7); g.fill(); g.fillStyle = lit === 'T' ? '#000' : '#d8d8d8'; g.fillText('T', 24, 89.5);
+  if (show13) {
+    const on = lit === '13';
+    g.fillStyle = on ? '#ff2020' : `rgb(${120 + pulse * 120},10,10)`; g.beginPath(); g.arc(24, 11, 5.5, 0, 7); g.fill();
+    g.fillStyle = '#fff'; g.fillText('13', 24, 11.5);
+  }
+  panelTex.needsUpdate = true;
+}
+const indCv = document.createElement('canvas'); indCv.width = 48; indCv.height = 20;
+const indTex = new THREE.CanvasTexture(indCv); indTex.magFilter = indTex.minFilter = THREE.NearestFilter; indTex.generateMipmaps = false; indTex.colorSpace = THREE.SRGBColorSpace;
+function drawInd(txt, arrow = '') {
+  const g = indCv.getContext('2d'); g.fillStyle = '#100404'; g.fillRect(0, 0, 48, 20);
+  g.fillStyle = '#ff3a2a'; g.font = 'bold 15px monospace'; g.textAlign = 'center'; g.fillText(txt, 28, 16);
+  g.font = 'bold 10px monospace'; g.fillText(arrow, 8, 14); indTex.needsUpdate = true;
+}
+
+// ====================================================================
+//  CENÁRIO
+// ====================================================================
+const WORLD = new THREE.Group(); scene.add(WORLD);
+scene.background = new THREE.Color(0x000000);
+function P(w, h, mat, parent, pos, rotY = 0, rotX = 0) { return mesh(new THREE.PlaneGeometry(w, h), mat, parent, pos, [rotX, rotY, 0]); }
+function wallZ(par, x, z0, z1, y0, y1, dir, mat) { return P(z1 - z0, y1 - y0, mat, par, [x, (y0 + y1) / 2, (z0 + z1) / 2], dir > 0 ? Math.PI / 2 : -Math.PI / 2); }
+function wallX(par, z, x0, x1, y0, y1, dir, mat) { return P(x1 - x0, y1 - y0, mat, par, [(x0 + x1) / 2, (y0 + y1) / 2, z], dir > 0 ? 0 : Math.PI); }
+function floorAt(par, x0, x1, z0, z1, y, mat, up = true) { return P(x1 - x0, z1 - z0, mat, par, [(x0 + x1) / 2, y, (z0 + z1) / 2], 0, up ? -Math.PI / 2 : Math.PI / 2); }
+
+// ---- elevador: x[-0.8,0.8] z[-0.8,0.8] h2.3, porta em z=0.8
+const EL = joint(WORLD, [0, 0, 0]);
+const mMetal = L(0xffffff, T.metal);
+floorAt(EL, -0.8, 0.8, -0.8, 0.8, 0, L(0xffffff, T.elFloor)); floorAt(EL, -0.8, 0.8, -0.8, 0.8, 2.3, L(0x555555), false);
+wallX(EL, -0.8, -0.8, 0.8, 0, 2.3, 1, mMetal); wallZ(EL, -0.8, -0.8, 0.8, 0, 2.3, 1, mMetal); wallZ(EL, 0.8, -0.8, 0.8, 0, 2.3, -1, mMetal);
+wallX(EL, 0.8, -0.8, -0.5, 0, 2.3, -1, mMetal); wallX(EL, 0.8, 0.5, 0.8, 0, 2.3, -1, mMetal); wallX(EL, 0.8, -0.5, 0.5, 2.1, 2.3, -1, mMetal);
+const elLightMesh = mesh(new THREE.BoxGeometry(1.0, 0.02, 1.0), new THREE.MeshBasicMaterial({ color: 0xfff4d8 }), EL, [0, 2.29, 0]);
+mesh(new THREE.BoxGeometry(0.03, 0.03, 1.4), L(0x9a9a9a), EL, [-0.76, 0.95, 0]);              // corrimão
+mesh(new THREE.PlaneGeometry(0.16, 0.32), new THREE.MeshBasicMaterial({ map: panelTex }), EL, [0.79, 1.25, 0.55], [0, -Math.PI / 2, 0]);
+mesh(new THREE.PlaneGeometry(0.26, 0.11), new THREE.MeshBasicMaterial({ map: indTex }), EL, [0, 2.2, 0.79], [0, Math.PI, 0]);
+// portas (duas folhas deslizantes)
+const doorL = mesh(new THREE.BoxGeometry(0.5, 2.1, 0.03), mMetal, EL, [-0.25, 1.05, 0.82]);
+const doorR = mesh(new THREE.BoxGeometry(0.5, 2.1, 0.03), mMetal, EL, [0.25, 1.05, 0.82]);
+function doors(k) { doorL.position.x = -0.25 - 0.5 * k; doorR.position.x = 0.25 + 0.5 * k; }
+// indicador do lado de fora (portaria)
+mesh(new THREE.PlaneGeometry(0.26, 0.11), new THREE.MeshBasicMaterial({ map: indTex }), EL, [0, 2.45, 0.885]);
+mesh(new THREE.BoxGeometry(1.3, 0.12, 0.06), L(0x6a6e72), EL, [0, 2.15, 0.9]);
+const elLight = new THREE.PointLight(0xfff0d0, 3.2, 4, 1.5); elLight.position.set(0, 2.1, 0); EL.add(elLight);
+
+// ---- 13º andar: corredor z[0.84,12] x[-1,1] h2.5
+const F13 = joint(WORLD, [0, 0, 0]);
+const mCorr = L(0xffffff, T.corrWall);
+floorAt(F13, -1, 1, 0.84, 12, 0, L(0xffffff, T.carpetRed)); floorAt(F13, -1, 1, 0.84, 12, 2.5, L(0xffffff, T.ceil), false);
+wallZ(F13, -1, 0.84, 12, 0, 2.5, 1, mCorr); wallZ(F13, 1, 0.84, 12, 0, 2.5, -1, mCorr); wallX(F13, 12, -1, 1, 0, 2.5, -1, mCorr);
+wallX(F13, 0.86, -1, -0.65, 0, 2.5, 1, mCorr); wallX(F13, 0.86, 0.65, 1, 0, 2.5, 1, mCorr); wallX(F13, 0.86, -0.65, 0.65, 2.3, 2.5, 1, mCorr);
+for (const z of [3, 6, 9]) for (const s of [-1, 1])
+  mesh(new THREE.BoxGeometry(0.04, 2.05, 0.9), L(0xffffff, T.door13), F13, [0.98 * s, 1.025, z]).rotation.y = s > 0 ? Math.PI : 0;
+const redLights = [2.5, 6.5, 10.5].map((z) => { const l = new THREE.PointLight(0xff2a1a, 3.5, 6, 1.5); l.position.set(0, 2.3, z); F13.add(l); return l; });
+const redBulbs = [2.5, 6.5, 10.5].map((z) => mesh(new THREE.BoxGeometry(0.2, 0.06, 0.2), new THREE.MeshBasicMaterial({ color: 0xff3020 }), F13, [0, 2.47, z]));
+F13.add(new THREE.AmbientLight(0x401010, 1.2));
+
+// ---- portaria (térreo): x[-4,4] z[0.84,9] h3
+const LOBBY = joint(WORLD, [0, 0, 0]);
+floorAt(LOBBY, -4, 4, 0.84, 9, 0, L(0xffffff, T.marble)); floorAt(LOBBY, -4, 4, 0.84, 9, 3, L(0xffffff, T.ceil), false);
+const mLob = L(0xffffff, T.lobbyWall);
+wallZ(LOBBY, -4, 0.84, 9, 0, 3, 1, mLob); wallZ(LOBBY, 4, 0.84, 9, 0, 3, -1, mLob);
+wallX(LOBBY, 0.86, -4, -0.65, 0, 3, 1, mLob); wallX(LOBBY, 0.86, 0.65, 4, 0, 3, 1, mLob); wallX(LOBBY, 0.86, -0.65, 0.65, 2.3, 3, 1, mLob);
+wallX(LOBBY, 9, -4, 4, 0, 3, -1, new THREE.MeshBasicMaterial({ map: T.street, color: 0x8090b0 }));
+for (const x of [-2, 0, 2]) mesh(new THREE.BoxGeometry(0.05, 3, 0.05), L(0x222222), LOBBY, [x, 1.5, 8.97]);
+mesh(new THREE.BoxGeometry(1.8, 1.05, 0.7), L(0x4a2e1a), LOBBY, [2.4, 0.525, 4.2]);                  // balcão
+mesh(new THREE.BoxGeometry(1.9, 0.05, 0.8), L(0x2a1a0e), LOBBY, [2.4, 1.07, 4.2]);
+const mon = joint(LOBBY, [2.2, 1.1, 4.0]); mon.rotation.y = Math.PI * 0.85;
+mesh(new THREE.BoxGeometry(0.42, 0.34, 0.36), L(0x2a2a2c), mon, [0, 0.17, 0]);
+const monScreenMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+mesh(new THREE.PlaneGeometry(0.34, 0.26), monScreenMat, mon, [0, 0.18, 0.181]);
+for (const [x, z] of [[-3.4, 2], [-3.4, 8]]) { mesh(new THREE.CylinderGeometry(0.2, 0.15, 0.5, 8), L(0x5a3a2a), LOBBY, [x, 0.25, z]); mesh(new THREE.ConeGeometry(0.4, 1.2, 6), L(0x1a3a1a), LOBBY, [x, 1.1, z]); }
+const lobbyLights = [[-2, 3], [2, 3], [0, 6.5]].map(([x, z]) => { const l = new THREE.PointLight(0xffe0b0, 4, 7, 1.5); l.position.set(x, 2.8, z); LOBBY.add(l); return l; });
+LOBBY.add(new THREE.AmbientLight(0x403830, 1.6));
+WORLD.add(new THREE.AmbientLight(0x202024, 1.0));
+
+// ====================================================================
+//  PERSONAGENS
+// ====================================================================
+function makePerson(faceTex, o = {}) {
+  const m = { shirt: L(0xffffff, o.shirt || T.jacket), pants: L(0xffffff, o.pants || T.jeans), skin: L(o.skin || 0xc8906c), shoe: L(0x141414), hair: L(o.hair || 0x1a120c),
+              face: L(0xffffff, faceTex) };
+  const root = new THREE.Group(); WORLD.add(root); root.scale.setScalar(o.scale || 1);
+  const hipH = 0.92, armK = o.arm || 1;
+  const hips = joint(root, [0, hipH, 0]);
+  mesh(new THREE.BoxGeometry(0.34, 0.18, 0.2), m.pants, hips);
+  const k = { root, hips, hipH, mats: m };
+  for (const [s, n] of [[1, 'l'], [-1, 'r']]) {
+    const hip = joint(hips, [0.095 * s, -0.05, 0]); limb(hip, 0.44, 0.085, 0.065, m.pants);
+    const knee = joint(hip, [0, -0.44, 0]); limb(knee, 0.42, 0.062, 0.048, m.pants);
+    const ankle = joint(knee, [0, -0.42, 0]); mesh(new THREE.BoxGeometry(0.11, 0.08, 0.27), m.shoe, ankle, [0, -0.03, 0.06]);
+    k[n] = { hip, knee, ankle };
+  }
+  const spine = joint(hips, [0, 0.06, 0]); k.spine = spine;
+  const tg = new THREE.CylinderGeometry(0.2, 0.17, 0.56, 8); tg.translate(0, 0.28, 0);
+  mesh(tg, m.shirt, spine, null, null, [1, 1, 0.62]);
+  if (o.tie) { mesh(new THREE.BoxGeometry(0.1, 0.4, 0.01), L(0xe8e8e8), spine, [0, 0.33, 0.112]); mesh(new THREE.BoxGeometry(0.035, 0.3, 0.012), L(0x5a0a0a), spine, [0, 0.36, 0.118]); }
+  const neck = joint(spine, [0, 0.56, 0]); k.neck = neck;
+  const nl = o.neck || 0.09;
+  limb(neck, nl + 0.02, 0.055, 0.05, m.skin).position.y = nl;
+  const head = joint(neck, [0, nl - 0.01, 0]); k.head = head;
+  mesh(new THREE.SphereGeometry(0.118, 12, 10), m.face, head, [0, 0.13, 0], null, [0.92, 1.1, 1]);
+  if (!o.bald) mesh(new THREE.SphereGeometry(0.125, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.4), m.hair, head, [0, 0.145, -0.01], [-0.25, 0, 0], [0.96, 1.05, 1.04]);
+  if (o.cap) { mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.08, 10), L(0x1a2448), head, [0, 0.235, 0]); mesh(new THREE.BoxGeometry(0.2, 0.015, 0.1), L(0x101010), head, [0, 0.2, 0.12]); }
+  if (!o.noEars) for (const s of [-1, 1]) mesh(new THREE.SphereGeometry(0.028, 6, 4), m.skin, head, [0.108 * s, 0.12, 0], null, [0.5, 1, 0.8]);
+  for (const [s, n] of [[1, 'l'], [-1, 'r']]) {
+    const sh = joint(spine, [0.225 * s, 0.5, 0]);
+    mesh(new THREE.SphereGeometry(0.065, 6, 5), m.shirt, sh);
+    limb(sh, 0.3 * armK, 0.062, 0.05, m.shirt);
+    const el = joint(sh, [0, -0.3 * armK, 0]); limb(el, 0.27 * armK, 0.05, 0.04, m.shirt);
+    const wr = joint(el, [0, -0.27 * armK, 0]);
+    mesh(new THREE.BoxGeometry(0.035, 0.08, 0.075), m.skin, wr, [0, -0.04, 0]);
+    const fl = o.fingers || 0.07;
+    for (let f = 0; f < 4; f++) limb(joint(wr, [0, -0.08, 0.028 - f * 0.019]), fl, 0.009, 0.006, m.skin, 4);
+    k[n].sh = sh; k[n].el = el; k[n].wr = wr;
+  }
+  return k;
+}
+function reset(k) {
+  for (const n of ['l', 'r']) for (const j of Object.values(k[n])) j.rotation.set(0, 0, 0);
+  k.spine.rotation.set(0, 0, 0); k.neck.rotation.set(0, 0, 0); k.head.rotation.set(0, 0, 0); k.hips.rotation.set(0, 0, 0);
+  k.hips.position.set(0, k.hipH, 0); k.root.rotation.set(0, 0, 0);
+}
+function stand(k, t = 0) {
+  reset(k); k.hips.position.y = k.hipH + Math.sin(t * 2) * 0.004;
+  k.l.sh.rotation.z = 0.08; k.r.sh.rotation.z = -0.08; k.l.el.rotation.x = -0.15; k.r.el.rotation.x = -0.15;
+}
+function walk(k, ph, run = 0) {
+  reset(k); const s = Math.sin(ph), c = Math.cos(ph), a = 0.42 + run * 0.35;
+  k.hips.position.y = k.hipH + Math.abs(c) * (0.025 + run * 0.04);
+  k.l.hip.rotation.x = -s * a; k.r.hip.rotation.x = s * a;
+  k.l.knee.rotation.x = Math.max(0, s) * (0.7 + run * 0.6) + 0.05; k.r.knee.rotation.x = Math.max(0, -s) * (0.7 + run * 0.6) + 0.05;
+  k.l.sh.rotation.x = s * (0.3 + run * 0.5); k.r.sh.rotation.x = -s * (0.3 + run * 0.5); k.l.sh.rotation.z = 0.08; k.r.sh.rotation.z = -0.08;
+  k.l.el.rotation.x = -0.2 - run * 1.0; k.r.el.rotation.x = -0.2 - run * 1.0;
+  k.spine.rotation.x = 0.05 + run * 0.25;
+}
+function pressPose(k, a) { k.r.sh.rotation.set(-1.25 * a, 0, -0.25 * a); k.r.el.rotation.set(-0.35 * a, 0, 0); }
+
+const you = makePerson(T.face);
+const faceless = makePerson(T.faceBlank, { shirt: T.suit, pants: T.suit, skin: 0xd6cfc6, scale: 1.12, arm: 1.3, neck: 0.15, tie: true, noEars: true, fingers: 0.13 });
+const doorman = makePerson(T.faceOld, { shirt: T.uniform, pants: T.grayPants, skin: 0xb98463, cap: true, hair: 0x6a6a6a });
+function hideAll() { for (const k of [you, faceless, doorman]) k.root.visible = false; }
+
+// ====================================================================
+//  Câmera de segurança: render pequeno -> textura do monitor
+// ====================================================================
+const CW = 96, CH = 72;
+const camCv = document.createElement('canvas'); camCv.width = CW; camCv.height = CH;
+const camCtx = camCv.getContext('2d');
+const camTex = new THREE.CanvasTexture(camCv); camTex.magFilter = camTex.minFilter = THREE.NearestFilter; camTex.generateMipmaps = false; camTex.colorSpace = THREE.SRGBColorSpace;
+monScreenMat.map = camTex;
+const secCam = new THREE.PerspectiveCamera(80, CW / CH, 0.05, 50);
+function cctvOverlay(g, w, h, t, scale) {
+  g.fillStyle = '#e8e8e8'; g.font = `bold ${7 * scale}px monospace`; g.textAlign = 'left';
+  g.fillText('CAM 02  ELEVADOR', 4 * scale, 9 * scale);
+  g.textAlign = 'right'; g.fillText('03:13:' + String(Math.floor(t) % 60).padStart(2, '0'), w - 4 * scale, h - 4 * scale);
+  if (Math.floor(t * 2) % 2) { g.fillStyle = '#ff2020'; g.beginPath(); g.arc(w - 8 * scale, 7 * scale, 2.5 * scale, 0, 7); g.fill(); }
+}
+function renderCCTV(t) {
+  secCam.position.set(-0.7, 2.2, -0.7); secCam.lookAt(0.2, 0.9, 0.6);
+  snapU.value.set(CW / 3, CH / 3);
+  const m = monScreenMat.map; monScreenMat.map = null; monScreenMat.color.setRGB(0.05, 0.05, 0.05); monScreenMat.needsUpdate = true;
+  renderer.setViewport(0, 0, CW, CH); renderer.setScissor(0, 0, CW, CH); renderer.setScissorTest(true);
+  renderer.render(scene, secCam);
+  renderer.setScissorTest(false); renderer.setViewport(0, 0, W, H);
+  camCtx.drawImage(renderer.domElement, 0, H - CH, CW, CH, 0, 0, CW, CH);
+  const d = camCtx.getImageData(0, 0, CW, CH), r = rng(Math.floor(t * 30));
+  for (let i = 0; i < d.data.length; i += 4) { const v = (d.data[i] * 0.3 + d.data[i + 1] * 0.59 + d.data[i + 2] * 0.11) * 1.2 + (r() - 0.5) * 30; d.data[i] = v * 0.85; d.data[i + 1] = v; d.data[i + 2] = v * 0.85; }
+  camCtx.putImageData(d, 0, 0);
+  camCtx.fillStyle = 'rgba(0,0,0,0.25)'; for (let y = 0; y < CH; y += 2) camCtx.fillRect(0, y, CW, 1);
+  cctvOverlay(camCtx, CW, CH, t, 1);
+  camTex.needsUpdate = true; monScreenMat.map = m; monScreenMat.color.setRGB(1, 1, 1); monScreenMat.needsUpdate = true;
+  snapU.value.set(W / 2, H / 2);
+}
+
+// ====================================================================
+//  ROTEIRO
+// ====================================================================
+const A = (x, y, z) => new THREE.Vector3(x, y, z);
+function base(floor) {
+  hideAll();
+  F13.visible = floor === 13; LOBBY.visible = floor === 0;
+  scene.fog = floor === 13 ? new THREE.Fog(0x1a0404, 3, 13) : new THREE.Fog(0x000000, 6, 20);
+  camera.near = 0.03; camera.fov = 55; camera.updateProjectionMatrix();
+  elLight.intensity = 3.2; elLightMesh.visible = true; doors(0);
+  redLights.forEach((l) => (l.intensity = 3.5)); redBulbs.forEach((b) => (b.visible = true));
+  faceless.head.rotation.set(0, 0, 0);
+}
+const elFlicker = (t, p = 0.12) => rng(Math.floor(t * 12) + 3)() < p;
+
+function sceneHook(t, f) {
+  base(13);
+  drawPanel(true, '', 0.5 + 0.5 * Math.sin(t * 6)); drawInd('12');
+  const flash = t > M.flash && t < M.flash + 0.3;
+  if (flash) {
+    faceless.root.visible = true; stand(faceless, t); faceless.root.position.set(0, 0, 4.2); faceless.root.rotation.y = Math.PI;
+    faceless.head.rotation.z = 0.4;
+    const hp = wpos(faceless.head, [0, 0.13, 0]);
+    camAt(camera, hp.clone().add(A(0.05, -0.02, -0.55)), hp, 0.02, f);
+    renderer.render(scene, camera);
+    post({ tint: [1.3, 0.7, 0.7], grain: 26, glitch: 0.6, zoom: 1.08 }, f); return;
+  }
+  you.root.visible = true; stand(you, t); you.root.position.set(0.1, 0, 0.1); you.root.rotation.y = Math.PI / 2;
+  pressPose(you, 0.55 + t * 0.06);
+  const k = ease(t / 5.5);
+  camAt(camera, A(lerp(0.45, 0.5, k), 1.38, lerp(0.25, 0.4, k)), A(0.79, lerp(1.28, 1.33, k), 0.55), 0.002, f);
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 1, 0.95], grain: 12, zoom: t < 0.25 ? 1.2 - t * 0.8 : 1 + k * 0.08, glitch: t < 0.3 ? 0.8 : 0, static: t < 0.12 ? 0.7 : 0 }, f);
+}
+
+function sceneElevador(t, f) {
+  base(0); LOBBY.visible = false;
+  you.root.visible = true; stand(you, t); you.root.position.set(0.25, 0, 0.15); you.root.rotation.y = 0;
+  drawInd('T');
+  let zoom = 1;
+  if (t < M.panel) {
+    drawPanel(false, '');
+    const k = ease(seg01(t, 5.5, M.panel));
+    camAt(camera, A(-0.6, 2.05, -0.65), A(lerp(0.2, 0.3, k), 1.0, 0.5));
+  } else {
+    drawPanel(true, t > M.press ? '13' : '', 0.5 + 0.5 * Math.sin(t * 7));
+    if (t > M.panel + 0.15 && t < M.panel + 0.3) zoom = 1.12;
+    you.root.position.set(0.15, 0, 0.15); you.root.rotation.y = Math.PI / 2;
+    pressPose(you, ease(seg01(t, M.press - 0.9, M.press)));
+    camAt(camera, A(0.36, 1.42, 0.02), A(0.79, 1.29, 0.55), 0.002, f);
+    if (t > M.press && t < M.press + 0.3) zoom = 1.15;
+  }
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 1, 0.95], grain: 12, zoom, glitch: t > M.press && t < M.press + 0.2 ? 0.6 : 0 }, f);
+}
+
+function sceneSubida(t, f) {
+  base(13);
+  you.root.visible = false;
+  drawPanel(true, '13');
+  const floors = ['10', '11', '12', '12', '13'];
+  const idx = Math.min(4, Math.floor((t - 20) / 1.1));
+  const fl = elFlicker(t, 0.18);
+  drawInd(t > M.stop ? '13' : floors[idx], t > M.stop ? '' : '▲');
+  elLight.intensity = fl ? 0.3 : 3.2; elLightMesh.visible = !fl;
+  if (t < M.stop) {
+    camAt(camera, A(0, 1.7, -0.1), A(0, 2.18, 0.79), 0.003, f);   // olhando o visor
+  } else {
+    doors(ease(seg01(t, M.open, M.open + 1.4)));
+    const k = ease(seg01(t, M.stop, 30));
+    camAt(camera, A(0, lerp(1.55, 1.6, k), lerp(-0.55, -0.35, k)), A(0, 1.35, 5));
+  }
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 0.95, 0.9], grain: 12, bright: fl ? 0.55 : 1, zoom: t > M.stop && t < M.stop + 0.12 ? 1.1 : 1 }, f);
+}
+
+function sceneAndar(t, f) {
+  base(13); doors(1); drawInd('13');
+  const fl = elFlicker(t, 0.08);
+  redLights.forEach((l, i) => (l.intensity = rng(Math.floor(t * 9) + i * 7)() < 0.12 ? 0.6 : 3.5));
+  faceless.root.visible = true; stand(faceless, 0); faceless.root.position.set(0, 0, 11.65); faceless.root.rotation.y = 0;
+  faceless.neck.rotation.x = 0.15;
+  you.root.visible = true;
+  const zEnd = 9.6;
+  if (t < M.turn) {
+    const k = seg01(t, 30, M.approach + 1.8);
+    const z = lerp(0.2, zEnd, ease(k));
+    if (k < 1) walk(you, (t - 30) * 5); else stand(you, t);
+    you.root.position.set(-0.1, 0, z); you.root.rotation.y = 0;
+    if (t < M.approach) camAt(camera, A(0.35, 1.85, z - 1.6), A(0, 1.2, z + 3));
+    else { const k2 = ease(seg01(t, M.approach, M.turn)); camAt(camera, A(lerp(0.35, 0.2, k2), lerp(1.85, 1.7, k2), z - lerp(1.6, 0.6, k2)), A(0, 1.5, 11.6)); }
+  } else {
+    // ele se vira, aos trancos (8 fps)
+    stand(you, t); you.root.position.set(-0.1, 0, zEnd);
+    const k = Math.floor(clamp((t - M.turn) / 0.55) * 4) / 4;
+    faceless.root.rotation.y = Math.PI * k; faceless.head.rotation.z = 0.35 * k;
+    you.root.visible = false;
+    const hp = wpos(faceless.head, [0, 0.13, 0]);
+    const d = t < M.scare ? 1.6 : lerp(1.1, 0.55, ease(seg01(t, M.scare, M.scare + 0.25)));
+    camAt(camera, A(hp.x + 0.05, hp.y - 0.05, hp.z - d), hp, t > M.scare ? 0.03 : 0.004, f);
+  }
+  renderer.render(scene, camera);
+  const sc = t > M.scare && t < M.scare + 0.6;
+  post({ tint: [1.2, 0.85, 0.85], grain: sc ? 28 : 12, glitch: sc ? 1 : 0, flash: t > M.scare && t < M.scare + 0.07 ? 0.6 : 0, zoom: sc ? 1.12 : 1, bright: fl ? 0.7 : 1 }, f);
+}
+
+function sceneFuga(t, f) {
+  base(13); drawInd('13');
+  faceless.root.visible = true; you.root.visible = true;
+  let fx = { tint: [1.2, 0.85, 0.85], grain: 14 };
+  if (t < M.run) {
+    // o "rosto" liso encarando
+    stand(faceless, t); faceless.root.position.set(0, 0, 11.65); faceless.root.rotation.y = Math.PI; faceless.head.rotation.z = 0.35 + Math.sin(step(t, 6) * 3) * 0.08;
+    you.root.visible = false;
+    const hp = wpos(faceless.head, [0, 0.13, 0]);
+    camAt(camera, A(hp.x + 0.03, hp.y - 0.02, hp.z - lerp(0.7, 0.5, seg01(t, 47, M.run))), hp, 0.003, f);
+  } else if (t < M.inside) {
+    // você corre para o elevador; ele vem atrás, aos trancos
+    const k = seg01(t, M.run, M.inside);
+    const zy = lerp(9.4, 1.6, k), zf = lerp(11.6, 6.0, k);
+    walk(you, t * 11, 1); you.root.position.set(-0.1, 0, zy); you.root.rotation.y = Math.PI;
+    walk(faceless, step(t, 8) * 13, 1); faceless.root.position.set(0.15, 0, zf); faceless.root.rotation.y = Math.PI; faceless.head.rotation.z = 0.4;
+    camAt(camera, A(0.3, 1.5, zy - 1.9), A(0, 1.3, zy + 1.5), 0.02, f);
+    fx.glitch = rng(Math.floor(t * 8))() < 0.15 ? 0.5 : 0;
+  } else {
+    // dentro do elevador: porta fechando, ele chegando
+    you.root.visible = false;
+    const k = seg01(t, M.inside, M.shut);
+    doors(1 - ease(k));
+    const zf = lerp(5.6, 1.15, clamp((t - M.inside) / (M.shut - M.inside - 0.1)));
+    walk(faceless, step(t, 8) * 13, 1); faceless.root.position.set(0.05, 0, zf); faceless.root.rotation.y = Math.PI; faceless.root.visible = t < M.shut;
+    faceless.r.sh.rotation.x = -1.5; faceless.r.el.rotation.x = -0.1; faceless.head.rotation.z = 0.4;
+    camAt(camera, A(0, 1.6, -0.55), A(0, 1.45, 3), t > M.shut - 0.4 ? 0.03 : 0.006, f);
+    drawPanel(true, 'T');
+    if (t > M.shut) { const r = rng(Math.floor(t * 20))(); elLight.intensity = r < 0.3 ? 0.4 : 2.6; fx = { tint: [1.05, 0.95, 0.9], grain: 14, zoom: t < M.shut + 0.15 ? 1.08 : 1, bright: r < 0.3 ? 0.6 : 1 }; }
+  }
+  renderer.render(scene, camera);
+  post(fx, f);
+}
+
+function sceneDescida(t, f) {
+  base(0); LOBBY.visible = t > M.lobbyOpen - 0.3;
+  you.root.visible = false; drawPanel(true, 'T');
+  const stuck = t < M.terreo;
+  const g = stuck && rng(Math.floor(t * 10))() < 0.35;
+  drawInd(stuck ? (g ? '1?' : '13') : 'T', stuck ? '▼' : '');
+  const fl = elFlicker(t, stuck ? 0.25 : 0);
+  elLight.intensity = fl ? 0.3 : 3.2;
+  if (t < M.lobbyOpen) camAt(camera, A(0, 1.7, -0.1), A(0, 2.18, 0.79), 0.003, f);
+  else { doors(ease(seg01(t, M.lobbyOpen, M.lobbyOpen + 1.2))); camAt(camera, A(0, 1.6, -0.5), A(0, 1.4, 5)); }
+  renderer.render(scene, camera);
+  post({ tint: [1.05, 0.98, 0.92], grain: 12, glitch: g ? 0.4 : 0, bright: fl ? 0.5 : 1, zoom: t > M.terreo && t < M.terreo + 0.12 ? 1.08 : 1 }, f);
+}
+
+function placeLobby(t) {
+  doorman.root.visible = true; stand(doorman, t); doorman.root.position.set(2.0, 0, 3.55); doorman.root.rotation.y = Math.PI * 0.85 + Math.PI;
+  doorman.r.sh.rotation.x = -0.4; doorman.l.sh.rotation.x = -0.4; doorman.neck.rotation.x = 0.15;
+}
+function sceneportaria(t, f) {
+  base(0); doors(1); drawInd('T'); drawPanel(true, '');
+  placeLobby(t);
+  // dentro do elevador (visto só pela câmera de segurança): ele, acenando
+  faceless.root.visible = true; stand(faceless, t); faceless.root.position.set(0.15, 0, 0.42); faceless.root.rotation.y = 0;
+  if (t > M.wave) { const w = Math.sin(step(t, 8) * 7); faceless.r.sh.rotation.set(-0.2, 0, -1.9); faceless.r.el.rotation.set(0, 0, 0.6 * w - 0.3); faceless.head.rotation.z = 0.4; }
+  if (t > M.camLook) { const k = Math.floor(clamp((t - M.camLook) / 0.5) * 3) / 3; headLook(faceless.head, secCam.position.clone().add(WORLD.position), k, 0.4); }
+  renderCCTV(t);
+  let fx = { tint: [1.05, 1, 0.92], grain: 12 };
+  if (t < M.cctv) {
+    // você sai do elevador; o porteiro, branco, olhando o monitor
+    you.root.visible = true; const k = seg01(t, 68, 70.5);
+    if (k < 1) walk(you, t * 5); else stand(you, t);
+    you.root.position.set(lerp(0, 1.2, k), 0, lerp(1.4, 3.0, k)); you.root.rotation.y = 0.6;
+    const k2 = ease(seg01(t, 70.2, M.cctv));
+    const dh = wpos(doorman.head, [0, 0.13, 0]);
+    camAt(camera, k2 < 0.01 ? A(-1.5, 1.9, 6.5) : A(lerp(2.9, 2.75, k2), 1.5, lerp(2.9, 3.25, k2)), k2 < 0.01 ? A(1.0, 1.0, 2.5) : dh.clone().lerp(wpos(mon, [0, 0.18, 0]), k2 * 0.8), 0.002, f);
+    renderer.render(scene, camera);
+    post(fx, f);
+  } else {
+    // tela cheia da câmera de segurança
+    LOBBY.visible = false; doorman.root.visible = false;
+    camera.position.set(-0.7, 2.25, -0.7); camera.up.set(0, 1, 0);
+    const zi = ease(seg01(t, M.camLook, M.camLook + 2.5));
+    camera.fov = lerp(72, 38, zi); camera.updateProjectionMatrix();
+    camera.lookAt(wpos(faceless.head, [0, 0.1, 0]).lerp(A(0.15, 1.05, 0.42), 1 - zi));
+    snapU.value.set(W / 3, H / 3); renderer.render(scene, camera); snapU.value.set(W / 2, H / 2);
+    post({ gray: true, grain: 28, glitch: t > M.camLook && t < M.camLook + 0.5 ? 1 : (rng(f)() < 0.05 ? 0.4 : 0), bright: 1.25 }, f);
+    cctvOverlay(octx, OW, OH, t, 2.6);
+  }
+}
+
+function sceneFinal(t, f) {
+  base(0); drawPanel(true, '');
+  placeLobby(t); doorman.neck.rotation.y = -0.6;
+  you.root.visible = true; stand(you, t); you.root.position.set(1.1, 0, 3.2);
+  const turn = ease(seg01(t, M.close, M.close + 1.6));
+  you.root.rotation.y = lerp(0.6, Math.PI + 0.2, turn);
+  doors(1 - ease(seg01(t, M.close + 0.8, M.close + 2.6)));
+  const up = t > M.goUp;
+  const n = up ? Math.min(13, 1 + Math.floor((t - M.goUp) * 4)) : 0;
+  drawInd(up ? String(n) : 'T', up ? '▲' : '');
+  const k = ease(seg01(t, M.close, M.end));
+  camAt(camera, A(lerp(2.6, 1.6, k), lerp(1.6, 1.9, k), lerp(5.5, 4.4, k)), A(lerp(0.6, 0, k), lerp(1.4, 2.1, k), 0.8));
+  if (t > M.goUp + 2.8) camAt(camera, A(0, 2.15, 1.75), A(0, 2.25, 0.885), 0.004, f);   // o visor: 13
+  renderer.render(scene, camera);
+  if (t >= M.end) { post({ black: true }, f); return; }
+  post({ tint: [1.05, 1, 0.92], grain: 12, glitch: n === 13 && rng(f)() < 0.4 ? 0.6 : 0, red: n === 13 ? 0.2 : 0 }, f);
+}
+
+const SCENES = { hook: sceneHook, elevador: sceneElevador, subida: sceneSubida, andar: sceneAndar, fuga: sceneFuga, descida: sceneDescida, portaria: sceneportaria, final: sceneFinal };
+window.renderAt = (t) => {
+  const f = Math.round(t * TL.fps);
+  const s0 = TL.scenes.find((s) => t >= s.t0 && t < s.t1) || TL.scenes[TL.scenes.length - 1];
+  SCENES[s0.name](t, f);
+  drawSubs(t);
+};
+window.frameJPEG = (t) => { window.renderAt(t); return out.toDataURL('image/jpeg', 0.9); };
+window.READY = true;
+if (!window.RENDER_MODE) {
+  const btn = document.createElement('button'); btn.id = 'play'; btn.textContent = '▶ ASSISTIR'; document.body.appendChild(btn);
+  btn.onclick = () => {
+    btn.remove(); const audio = new Audio('saida/audio.wav'); audio.play().catch(() => {});
+    const start = performance.now();
+    const loop = () => { const t = audio.currentTime > 0 ? audio.currentTime : (performance.now() - start) / 1000; if (t < TL.duration) { window.renderAt(t); requestAnimationFrame(loop); } };
+    loop();
+  };
+}
+</script>
+</body>
+</html>
